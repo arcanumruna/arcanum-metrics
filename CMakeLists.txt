@@ -9,11 +9,11 @@ option(METRICS_BUILD_BENCH "Build the library benchmarks" OFF)
 set(METRICS_SANITIZE "" CACHE STRING "Sanitizers for tests and bench, e.g. address,undefined or thread")
 
 add_library(metrics INTERFACE
-        include/metrics/Metrics.h
         include/metrics/MetricsLayout.h
         include/metrics/MetricsFile.h
         include/metrics/MetricsWriter.h
         include/metrics/MetricsReader.h
+        include/metrics/PrometheusText.h
         include/metrics/SystemMetrics.h
 )
 
@@ -24,7 +24,7 @@ target_include_directories(metrics INTERFACE
 
 add_library(metrics_dummy STATIC
         src/dummy.cpp
-        include/metrics/Metrics.h
+        include/metrics/MetricsLayout.h
 )
 
 target_include_directories(metrics_dummy PRIVATE

@@ -269,3 +269,50 @@ TEST(MetricsReaderRegression, ZeroAllocScanRegression) {
     EXPECT_EQ(seen, 50);
     (void)found;
 }
+
+namespace {
+// Raw stores into the file at a read step, simulating the writer part-way through free + allocate.
+struct RawState {
+    MetricsFile* file = nullptr;
+    int64_t newRegId = -1;  // -1: leave the regId alone (writer paused before the regId store)
+    bool fired = false;
+};
+struct RawHook {
+    RawState* st;
+    void operator()(ReadStep step, int32_t slot) const noexcept {
+        if (st->fired || step != ReadStep::AfterFirstRegId) return;
+        st->fired = true;
+        std::byte* meta = st->file->base() + st->file->layout().metadataOffset() + int64_t{slot} * kMetadataRecordLength;
+        std::byte* val = st->file->base() + st->file->layout().valuesOffset() + int64_t{slot} * kValueRecordLength;
+        auto ref32 = [&](int off) { return std::atomic_ref<int32_t>(*reinterpret_cast<int32_t*>(meta + off)); };
+        ref32(kMetaStateOffset).store(-1, std::memory_order_release);                               // free
+        std::atomic_ref<int64_t>(*reinterpret_cast<int64_t*>(val)).store(0, std::memory_order_release);  // zero for the next owner
+        if (st->newRegId >= 0) {
+            std::atomic_ref<int64_t>(*reinterpret_cast<int64_t*>(meta + kMetaRegIdOffset))
+                .store(st->newRegId, std::memory_order_release);
+            ref32(kMetaStateOffset).store(1, std::memory_order_release);  // published
+        }
+    }
+};
+}  // namespace
+
+// Found while designing the Task 6 stress test (the interleaving is rare on x86): free + zero before the new regId is stored leaves the old regId next to a
+// zeroed value; the reader must re-check the state, not only the regId.
+TEST(MetricsReaderRegression, StaleRegIdWithZeroedValueRegression) {
+    for (int64_t newRegId : {int64_t{-1}, int64_t{500}}) {
+        Env env(1);
+        MetricsWriter w(env.file, env.stack);
+        auto a = w.allocate(1, MetricKind::Counter, -1, {}, "old");
+        a.writer.set(12345);
+        RawState st{&env.file, newRegId, false};
+        BasicMetricsReader<RawHook> r(env.file, RawHook{&st});
+        const SlotView v = r.read(0);
+        ASSERT_TRUE(st.fired);
+        if (newRegId < 0) {
+            EXPECT_TRUE(std::holds_alternative<Empty>(v));  // freed mid-read: never Live{oldRegId, 0}
+        } else {
+            ASSERT_TRUE(std::holds_alternative<Reused>(v));
+            EXPECT_EQ(std::get<Reused>(v).oldRegId, a.regId);
+        }
+    }
+}

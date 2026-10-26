@@ -1,7 +1,6 @@
 #include "AllocCounter.h"
 
 #include "metrics/MetricsFile.h"
-#include "metrics/Metrics.h"  // 1.x API: only for the O_TRUNC/SIGBUS repro, deleted in Task 6
 
 #include <gtest/gtest.h>
 
@@ -152,31 +151,6 @@ TEST_F(MetricsFileRegression, RecreateWhileReaderMappedRegression) {
     EXPECT_EQ(again.layout().maxSlots, 1);
     EXPECT_EQ(rd<int64_t>(again, kHdrStartEpochNsOffset), 222);
     EXPECT_TRUE(again.sameInstanceAs(path_.c_str()));
-}
-
-// The repro: the 1.x create truncates the inode a reader still maps, so the reader gets SIGBUS.
-TEST_F(MetricsFileRegression, OldTruncCreateRaisesSigbusRegression) {
-    const pid_t pid = ::fork();
-    ASSERT_GE(pid, 0);
-    if (pid == 0) {
-        try {
-            { auto first = MetricsRegistry::create(path_, 64); }
-            int fd = ::open(path_.c_str(), O_RDONLY);
-            struct stat st;
-            ::fstat(fd, &st);
-            auto* p = static_cast<volatile unsigned char*>(::mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0));
-            auto second = MetricsRegistry::create(path_, 1);  // O_TRUNC + smaller ftruncate
-            unsigned sum = 0;
-            for (off_t i = 0; i < st.st_size; ++i) sum += p[i];
-            ::_exit(sum == 0xFFFFFFFFu ? 1 : 0);
-        } catch (...) {
-            ::_exit(3);
-        }
-    }
-    int status = 0;
-    ASSERT_EQ(::waitpid(pid, &status, 0), pid);
-    ASSERT_TRUE(WIFSIGNALED(status));
-    EXPECT_EQ(WTERMSIG(status), SIGBUS);
 }
 
 TEST_F(MetricsFileRegression, ReaderWaitsForVersionWordRegression) {

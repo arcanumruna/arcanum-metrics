@@ -1,4 +1,5 @@
 include(GoogleTest)
+find_package(Threads REQUIRED)
 
 # One executable per test file: AllocCounter.h replaces global operator new/delete,
 # so it may be included in exactly one translation unit per executable.
@@ -15,6 +16,10 @@ metrics_add_test(MetricsFileRegressionTest)
 metrics_add_test(MetricsWriterRegressionTest)
 metrics_add_test(MetricsReaderRegressionTest)
 metrics_add_test(SystemMetricsRegressionTest)
+metrics_add_test(PrometheusTextRegressionTest)
+metrics_add_test(MetricsConcurrencyRegressionTest)
+target_link_libraries(MetricsConcurrencyRegressionTest PRIVATE Threads::Threads)
+
 
 # Source guard: no read-modify-write atomics or locks in the library headers.
 add_test(NAME MetricsWriterRegression.NoAtomicRmwSourceRegression

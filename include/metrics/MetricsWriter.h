@@ -24,13 +24,23 @@ public:
     SlotWriter(int64_t* value, int32_t slot) noexcept : value_(value), slot_(slot) {}
 
     void add(int64_t n) const noexcept {
+#ifdef METRICS_TEST_PLAIN_STORE  // mutation switch for the TSan stress test: a non-atomic store
+        *value_ = static_cast<int64_t>(static_cast<uint64_t>(*value_) + static_cast<uint64_t>(n));
+        return;
+#endif
         std::atomic_ref<int64_t> ref(*value_);
         // Unsigned arithmetic: wraps in two's complement instead of signed-overflow UB.
         ref.store(static_cast<int64_t>(static_cast<uint64_t>(ref.load(std::memory_order_relaxed)) +
                                        static_cast<uint64_t>(n)),
                   std::memory_order_release);
     }
-    void set(int64_t v) const noexcept { std::atomic_ref<int64_t>(*value_).store(v, std::memory_order_release); }
+    void set(int64_t v) const noexcept {
+#ifdef METRICS_TEST_PLAIN_STORE
+        *value_ = v;
+        return;
+#endif
+        std::atomic_ref<int64_t>(*value_).store(v, std::memory_order_release);
+    }
     [[nodiscard]] int64_t get() const noexcept {
         return std::atomic_ref<int64_t>(*value_).load(std::memory_order_relaxed);
     }

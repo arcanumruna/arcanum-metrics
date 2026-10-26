@@ -1,6 +1,6 @@
 #pragma once
-// Reader side: acquire loads only, never writes the file. A slot is read as state, regId, value, regId again;
-// a changed regId means the slot was reused mid-read. Rates and windows are computed here from sampled totals
+// Reader side: acquire loads only, never writes the file. A slot is read as state, regId, value, state, regId;
+// a changed regId means the slot was reused mid-read, a state that is no longer Allocated means it was freed. Rates and windows are computed here from sampled totals
 // and levels with the caller's nowNs. No allocation, no exceptions, no clock.
 #include "metrics/MetricsFile.h"
 #include "metrics/MetricsLayout.h"
@@ -63,6 +63,11 @@ public:
         const int32_t labelLen = ref32(m, kMetaLabelLengthOffset).load(std::memory_order_relaxed);
         const int64_t value = std::atomic_ref<int64_t>(*valuePtr(slot)).load(std::memory_order_acquire);
         hook_(ReadStep::AfterValue, slot);
+        // State before regId: a value of 0 seen after a free proves the free is visible here, and a state of
+        // Allocated then proves the new regId is visible too. (regId first would allow Live{oldRegId, 0}.)
+        if (ref32(m, kMetaStateOffset).load(std::memory_order_acquire) != static_cast<int32_t>(SlotState::Allocated)) {
+            return Empty{};  // freed while reading
+        }
         const int64_t regIdAgain = ref64(m, kMetaRegIdOffset).load(std::memory_order_acquire);
         if (regIdAgain != regId) return Reused{slot, regId};
         return Live{slot,
