@@ -24,6 +24,10 @@ struct Empty {};
 // consistent whatever the writer does next. key() and label() view the copy inside this object (do not use them
 // after the Live is destroyed).
 struct Live {
+    // Leaves every field uninitialized (no zero fill of the byte arrays on each read): read() sets each field and
+    // the first keyLength / labelLength bytes. The arrays are std::byte so copying the unset tail is well defined.
+    Live() noexcept {}
+
     int32_t slot;
     int32_t typeId;
     MetricKind kind;
@@ -33,13 +37,13 @@ struct Live {
     int32_t keyLength;
     int32_t labelLength;
     std::array<std::byte, kMaxKeyLength> keyBytes;
-    std::array<char, kMaxLabelLength> labelBytes;
+    std::array<std::byte, kMaxLabelLength> labelBytes;
 
     [[nodiscard]] std::span<const std::byte> key() const noexcept {
         return std::span<const std::byte>(keyBytes.data(), static_cast<size_t>(keyLength));
     }
     [[nodiscard]] std::string_view label() const noexcept {
-        return std::string_view(labelBytes.data(), static_cast<size_t>(labelLength));
+        return std::string_view(reinterpret_cast<const char*>(labelBytes.data()), static_cast<size_t>(labelLength));
     }
 };
 struct Reused {
@@ -47,6 +51,10 @@ struct Reused {
     int64_t oldRegId;
 };
 using SlotView = std::variant<Empty, Live, Reused>;
+
+// Result of read(slot, Live&). Live: `out` is one owner's consistent copy. Reused: the slot changed owner while it
+// was read; out.slot and out.regId name the old owner, the other fields are unspecified. Empty: `out` is unspecified.
+enum class ReadStatus : int32_t { Empty, Live, Reused };
 
 struct SlotRef {
     int32_t slot;   // -1: none
@@ -68,18 +76,36 @@ public:
 
     [[nodiscard]] int32_t maxSlots() const noexcept { return layout_.maxSlots; }
 
+    // The variant form. One SlotView is built in place and returned (NRVO): no copy of the Live inside it.
     [[nodiscard]] SlotView read(int32_t slot) const noexcept {
-        if (slot < 0 || slot >= layout_.maxSlots) return Empty{};
+        SlotView view;
+        Live& l = view.template emplace<Live>();
+        switch (read(slot, l)) {
+            case ReadStatus::Live:
+                break;
+            case ReadStatus::Reused: {
+                const Reused r{slot, l.regId};  // copied out before emplace ends the Live
+                view.template emplace<Reused>(r);
+                break;
+            }
+            case ReadStatus::Empty:
+                view.template emplace<Empty>();
+                break;
+        }
+        return view;
+    }
+
+    // Reads `slot` into a caller-owned Live (reused across a scan: no variant, no copy). See ReadStatus.
+    [[nodiscard]] ReadStatus read(int32_t slot, Live& l) const noexcept {
+        if (slot < 0 || slot >= layout_.maxSlots) return ReadStatus::Empty;
         const std::byte* m = meta(slot);
         if (ref32(m, kMetaStateOffset).load(std::memory_order_acquire) != static_cast<int32_t>(SlotState::Allocated)) {
-            return Empty{};
+            return ReadStatus::Empty;
         }
         const int64_t regId = ref64(m, kMetaRegIdOffset).load(std::memory_order_acquire);
         hook_(ReadStep::AfterFirstRegId, slot);
 
         // Copy everything out with relaxed loads, then validate the copy with the checks below.
-        SlotView view;
-        Live& l = view.template emplace<Live>();
         l.slot = slot;
         l.regId = regId;
         l.typeId = ref32(m, kMetaTypeIdOffset).load(std::memory_order_relaxed);
@@ -98,40 +124,43 @@ public:
         // is visible too. (regId first would allow Live{oldRegId, 0}.)
         std::atomic_thread_fence(std::memory_order_acquire);
         if (ref32(m, kMetaStateOffset).load(std::memory_order_acquire) != static_cast<int32_t>(SlotState::Allocated)) {
-            return Empty{};  // freed while reading
+            return ReadStatus::Empty;  // freed while reading
         }
         hook_(ReadStep::AfterStateRecheck, slot);
-        if (ref64(m, kMetaRegIdOffset).load(std::memory_order_acquire) != regId) return Reused{slot, regId};
-        return view;
+        if (ref64(m, kMetaRegIdOffset).load(std::memory_order_acquire) != regId) return ReadStatus::Reused;
+        return ReadStatus::Live;
     }
 
-    // Calls f(const Live&) for every live slot. A slot found Reused is read once more. Slots are handed out in
-    // order, so the first Unused slot ends the scan.
+    // Calls f(const Live&) for every live slot; the Live is one stack object reused for the whole scan, valid
+    // only during the call. A slot found Reused is read once more. Slots are handed out in order, so the first
+    // Unused slot ends the scan.
     template <class F>
     void forEachLive(F&& f) const noexcept {
+        Live l;
         for (int32_t s = 0; s < layout_.maxSlots; ++s) {
             if (ref32(meta(s), kMetaStateOffset).load(std::memory_order_acquire) == static_cast<int32_t>(SlotState::Unused)) {
                 return;
             }
-            SlotView v = read(s);
-            if (std::holds_alternative<Reused>(v)) v = read(s);
-            if (const Live* l = std::get_if<Live>(&v)) f(*l);
+            ReadStatus st = read(s, l);
+            if (st == ReadStatus::Reused) st = read(s, l);
+            if (st == ReadStatus::Live) f(static_cast<const Live&>(l));
         }
     }
 
-    // First live slot with this typeId and key, with the regId it had when matched ({-1, -1} if none).
+    // First live slot with this typeId and key, with the regId it had when matched ({-1, -1} if none). A slot
+    // found Reused is read once more, as in forEachLive.
     [[nodiscard]] SlotRef findFirst(int32_t typeId, std::span<const std::byte> key) const noexcept {
         SlotRef found{-1, -1};
+        Live l;
         for (int32_t s = 0; s < layout_.maxSlots && found.slot < 0; ++s) {
             if (ref32(meta(s), kMetaStateOffset).load(std::memory_order_acquire) == static_cast<int32_t>(SlotState::Unused)) {
                 break;
             }
-            const SlotView v = read(s);
-            if (const Live* l = std::get_if<Live>(&v)) {
-                if (l->typeId == typeId && l->key().size() == key.size() &&
-                    (key.empty() || std::memcmp(l->key().data(), key.data(), key.size()) == 0)) {
-                    found = SlotRef{s, l->regId};
-                }
+            ReadStatus st = read(s, l);
+            if (st == ReadStatus::Reused) st = read(s, l);
+            if (st == ReadStatus::Live && l.typeId == typeId && l.key().size() == key.size() &&
+                (key.empty() || std::memcmp(l.key().data(), key.data(), key.size()) == 0)) {
+                found = SlotRef{s, l.regId};
             }
         }
         return found;
@@ -204,9 +233,9 @@ public:
     template <class Reader>
     void sample(const Reader& reader, int64_t nowNs) noexcept {
         const int32_t n = std::min(bound_, reader.maxSlots());
+        Live live;  // one stack Live for the whole sample
         for (int32_t s = 0; s < n; ++s) {
-            const SlotView v = reader.read(s);
-            const Live* l = std::get_if<Live>(&v);
+            const Live* l = reader.read(s, live) == ReadStatus::Live ? &live : nullptr;
             if (l == nullptr) {
                 entries_[s] = detail::RateAbsent{};
                 continue;
@@ -278,9 +307,9 @@ public:
     template <class Reader>
     void sample(const Reader& reader, [[maybe_unused]] int64_t nowNs) noexcept {
         const int32_t n = std::min(bound_, reader.maxSlots());
+        Live live;  // one stack Live for the whole sample
         for (int32_t s = 0; s < n; ++s) {
-            const SlotView v = reader.read(s);
-            const Live* l = std::get_if<Live>(&v);
+            const Live* l = reader.read(s, live) == ReadStatus::Live ? &live : nullptr;
             Entry& e = entries_[s];
             if (l == nullptr) {
                 e = Entry{};

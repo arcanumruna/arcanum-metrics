@@ -539,6 +539,24 @@ TEST(MetricsReaderRegression, RecheckOrderRegression) {
     EXPECT_EQ(std::get<Live>(again).value, 0);
 }
 
+// findFirst reads a slot found Reused once more, like forEachLive: a reallocation racing the lookup must not hide
+// the new owner of the same metric. The hook frees slot 0 mid-read and reallocates it with the same typeId and key.
+TEST(MetricsReaderRegression, FindFirstRetriesOnReusedRegression) {
+    Env env(2);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
+    auto a = w.allocate(1, MetricKind::Counter, -1, {}, "old");
+    a.writer.set(5);
+    ReuseState st{&w, ReadStep::AfterValue, false};  // frees slot 0, allocates typeId 1, empty key, "new", 777
+    BasicMetricsReader<ReuseHook> r(env.file, ReuseHook{&st});
+    const SlotRef found = r.findFirst(1, {});
+    ASSERT_TRUE(st.fired);
+    EXPECT_EQ(found.slot, 0) << "the new owner was hidden by the reuse";
+    EXPECT_GT(found.regId, a.regId);
+    const SlotView now = r.read(0);
+    ASSERT_TRUE(std::holds_alternative<Live>(now));
+    EXPECT_EQ(found.regId, std::get<Live>(now).regId);
+}
+
 TEST(MetricsReaderRegression, LabelCopiedBeforeCheckRegression) {
     for (ReadStep when : {ReadStep::AfterFirstRegId, ReadStep::AfterValue}) {
         Env env(2);

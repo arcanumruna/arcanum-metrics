@@ -68,6 +68,19 @@ void BM_ReaderRead(benchmark::State& state) {
 }
 BENCHMARK(BM_ReaderRead);
 
+void BM_ReaderReadInto(benchmark::State& state) {  // read(slot, Live&): one caller-owned Live, no variant
+    Fixture f;
+    metrics::MetricsReader r(f.file);
+    metrics::Live l;
+    int32_t s = 0;
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(r.read(s, l));
+        benchmark::DoNotOptimize(l.value);
+        s = (s + 1) & (kSlots - 1);
+    }
+}
+BENCHMARK(BM_ReaderReadInto);
+
 void BM_ForEachLive4096(benchmark::State& state) {
     Fixture f;
     metrics::MetricsReader r(f.file);
