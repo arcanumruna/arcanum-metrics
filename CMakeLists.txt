@@ -42,6 +42,14 @@ endif()
 if(METRICS_SANITIZE)
     add_compile_options(-fsanitize=${METRICS_SANITIZE} -fno-omit-frame-pointer)
     add_link_options(-fsanitize=${METRICS_SANITIZE})
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # Clang links its sanitizer runtime statically by default, and that archive defines the global
+        # operator new/delete, which collides with the counting replacements in tests/AllocCounter.h.
+        # The shared runtime is interposable (as gcc's libtsan/libasan already are).
+        execute_process(COMMAND ${CMAKE_CXX_COMPILER} --print-runtime-dir
+                OUTPUT_VARIABLE _metricsSanRuntimeDir OUTPUT_STRIP_TRAILING_WHITESPACE)
+        add_link_options(-shared-libsan "-Wl,-rpath,${_metricsSanRuntimeDir}")
+    endif()
 endif()
 
 if(METRICS_BUILD_TESTS OR METRICS_BUILD_BENCH)
