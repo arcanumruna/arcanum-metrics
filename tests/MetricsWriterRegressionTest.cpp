@@ -273,10 +273,3 @@ TEST(MetricsWriterRegression, ZeroAllocAllOpsRegression) {
     }
     EXPECT_EQ(scope.count(), 0);
 }
-
-TEST(MetricsWriterRegression, NoAtomicRmwRegression) {
-    // The compile-time half is the static_asserts at the top of this file; the source half is a ctest
-    // (MetricsWriterRegression.NoAtomicRmwSourceRegression) running cmake/CheckNoAtomicRmw.cmake.
-    static_assert(std::is_trivially_copyable_v<SlotWriter>);
-    SUCCEED();
-}

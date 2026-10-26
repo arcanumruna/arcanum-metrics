@@ -32,7 +32,7 @@ target_include_directories(metrics_dummy PRIVATE
 )
 
 # Configure-time guard: no fetch_add / compare_exchange / mutex in the headers.
-execute_process(COMMAND ${CMAKE_COMMAND} -DHEADER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/include/metrics
+execute_process(COMMAND ${CMAKE_COMMAND} -DHEADER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/include
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckNoAtomicRmw.cmake
         RESULT_VARIABLE _rmw_rc ERROR_VARIABLE _rmw_err)
 if(NOT _rmw_rc EQUAL 0)
