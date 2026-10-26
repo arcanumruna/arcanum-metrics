@@ -1,540 +1,277 @@
-# Metrics
+# arcanum-metrics
 
-A header-only, memory-mapped metrics library for C++23. Designed for low-latency
-inter-process communication: one producer process writes metrics into a shared-memory
-file; any number of reader processes (e.g. a Prometheus exporter) read them without
-coordination overhead.
+A header-only C++23 library for process metrics in a memory-mapped file, modelled on Aeron's counters
+(`CountersManager`). One process writes; any number of other processes (or threads) read, with no locks, no
+threads, no allocation and no exceptions on any call. Time never comes from the library: every call that needs it
+takes `nowNs` from the caller.
 
-## Table of Contents
+Version 2.0.0 is a clean break from 1.x (see [Migrating from 1.x](#migrating-from-1x)).
 
-- [Architecture](#architecture)
-- [Metric Types](#metric-types)
-  - [Counter](#counter)
-  - [Gauge](#gauge)
-  - [Throughput](#throughput)
-  - [WindowedMaxGauge](#windowedmaxgauge)
-  - [WindowedAvgGauge](#windowedavggauge)
-- [MetricsRegistry](#metricsregistry)
-- [Usage Examples](#usage-examples)
-  - [Producer process](#producer-process)
-  - [Reader / exporter process](#reader--exporter-process)
-  - [Measuring network bandwidth](#measuring-network-bandwidth)
-  - [10 Hz sensor with 1 Hz exporter](#10-hz-sensor-with-1-hz-exporter)
-- [Thread Safety](#thread-safety)
-- [Memory Layout](#memory-layout)
-- [Build & Integration](#build--integration)
+## Contents
 
----
+- [Model](#model)
+- [File layout](#file-layout)
+- [Writer](#writer)
+- [Reader](#reader)
+- [Rates and windows](#rates-and-windows)
+- [Prometheus text](#prometheus-text)
+- [SystemMetrics](#systemmetrics)
+- [Capacity](#capacity)
+- [Using it from Rune](#using-it-from-rune)
+- [Migrating from 1.x](#migrating-from-1x)
+- [Build, test and benchmark](#build-test-and-benchmark)
+- [Packaging](#packaging)
 
-## Architecture
+## Model
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    mmap file on disk                     │
-│                                                          │
-│  MetricsHeader (64 B)                                    │
-│  ├── magic, version, max_metrics                         │
-│  ├── metric_count  (atomic)                              │
-│  ├── metadata_offset, values_offset, total_size          │
-│                                                          │
-│  MetricMeta[max_metrics]  (256 B each, cache-aligned)    │
-│  ├── name  (Prometheus-style with optional labels)       │
-│  ├── type  (COUNTER | GAUGE | THROUGHPUT | WINDOWED_MAX | WINDOWED_AVG | …) │
-│  └── value_offset  (index into ValueSlot array)          │
-│                                                          │
-│  ValueSlot[max_metrics]  (64 B each, cache-aligned)      │
-│  └── value  (atomic int64_t)                             │
-└─────────────────────────────────────────────────────────┘
-         ▲ mmap(PROT_READ|PROT_WRITE)      ▲ mmap(PROT_READ)
-         │                                  │
-   Producer process                  Reader process(es)
-   MetricsRegistry::create()         MetricsRegistry::open()
-```
+- A file holds a fixed number of **slots**. A slot is a metadata record (type id, kind, key, label, registration id)
+  plus a value record (one `int64`).
+- Only **totals and levels** are written. A `Counter` is a monotonic total (`add`); a `Gauge` is a level (`set`).
+  Throughput (Δtotal/Δt) and windowed max/average are computed by the reader from samples it takes at its own period.
+- **One writer per slot** for the slot's whole allocated life. The writer does a plain load of its own value, an
+  add, and a release store (`std::atomic_ref<int64_t>::store(v, release)`, the same code as Aeron's
+  `putLongOrdered`). There is no `fetch_add`, no compare-exchange and no mutex anywhere in the headers; a CMake
+  check (`cmake/CheckNoAtomicRmw.cmake`) fails the configure if one appears.
+- **One allocator per file**, on one owner thread. `allocate` and `free` never run concurrently with each other.
+  A `SlotWriter` is handed to its writer thread before that thread starts (thread start gives happens-before), or
+  over a ring.
+- **Readers never write.** They use acquire loads and detect slot reuse by the registration id (`regId`).
+- Capacity is fixed when the file is created. `allocate` past the end returns `Full`; nothing grows or aborts.
 
-Key design decisions:
+## File layout
 
-| Property | Detail |
-|---|---|
-| Transport | POSIX `mmap` + `flock` for safe multi-process initialization |
-| Alignment | Every `ValueSlot` and `MetricMeta` is cache-line (64 B) aligned to eliminate false sharing |
-| Atomics | `std::atomic<int64_t>` with `memory_order_relaxed` for near-zero overhead reads and writes |
-| Header-only | The entire library is `include/metrics/Metrics.h`; no separate compilation required |
-| Standard | C++23 |
+Little-endian. `[header 4096 B][maxSlots x 512 B metadata][maxSlots x 128 B values]`. All offsets are in
+`include/metrics/MetricsLayout.h` with a `static_assert` each.
 
----
+| Header | offset | |
+| --- | --- | --- |
+| `layoutVersion` (i32) | 0 | written last with a release store; 0 means "being created" |
+| pad | 4 | |
+| `pid` (i64) | 8 | |
+| `startEpochNs` (i64) | 16 | passed in by the caller |
+| `maxSlots` (i32) | 24 | |
+| `metadataRecordLength` (i32) | 28 | 512 |
+| `valueRecordLength` (i32) | 32 | 128 |
+| user tag | 36 | up to the end of the 4096-byte header (4060 bytes) |
 
-## Metric Types
+| Metadata record | offset | |
+| --- | --- | --- |
+| `state` (i32) | 0 | `Unused = 0`, `Allocated = 1`, `Freed = -1` |
+| `typeId` (i32) | 4 | |
+| `regId` (i64) | 8 | |
+| `ownerTag` (i64) | 16 | |
+| `kind` (i32) | 24 | `Counter = 1`, `Gauge = 2` |
+| `keyLength` (i32) | 28 | |
+| key | 32 | 112 bytes |
+| `labelLength` (i32) | 144 | |
+| label | 148 | 364 bytes, ends at 512 |
 
-### Counter
+A value record is an `i64` at offset 0, padded to 128 bytes (two cache lines) against false sharing.
 
-A monotonically increasing 64-bit integer. Use it to count events (requests, errors,
-bytes sent, etc.). Counters must never decrease; they only reset when the process
-restarts.
+`maxSlots` is capped at `kMaxSlots` (2^20; `TooLarge`). Creating a file is `<path>.tmp.<pid>` (`O_CREAT|O_EXCL`), `ftruncate`, header with `layoutVersion = 0`, release store
+of the version, `fsync`, `rename` over `<path>`, then `fsync` of the parent directory. Two concurrent `create` calls for the same path
+in one process are a caller error. A reader that still maps the old file keeps reading its inode until
+it re-opens; there is no `O_TRUNC` and no `flock`. A reader re-opens when `sameInstanceAs(path)` is false (the device,
+inode or size at the path, or its `pid` or `startEpochNs`, differs from its mapping). A reader that opens a file being created polls the version
+word a bounded number of times and then fails with `NotReady`; it never reads a half-written header.
 
-```cpp
-CounterMetric requests = registry.register_counter("http_requests_total");
-```
-
-**API**
-
-| Method | Description |
-|---|---|
-| `inc()` | Increment by 1 |
-| `add(int64_t v)` | Add `v` (ignored if `v <= 0`) |
-| `get() -> int64_t` | Read current value |
-
----
-
-### Gauge
-
-A 64-bit integer that can go up or down. Use it for values that represent a current
-state: active connections, queue depth, memory usage, CPU temperature, etc.
+## Writer
 
 ```cpp
-GaugeMetric connections = registry.register_gauge("active_connections");
+#include <metrics/MetricsWriter.h>
+
+metrics::MetricsFile file;
+metrics::CreateParams params{path, maxSlots, metrics::requiredSlots(plan), pid, startEpochNs, userTag};
+if (metrics::MetricsFile::create(params, file) != metrics::FileStatus::Ok) { /* refuse to start */ }
+
+std::vector<int32_t> freeStack(maxSlots);            // storage for the free list, owned by the caller
+metrics::MetricsWriter writer;
+if (metrics::MetricsWriter::create(file, freeStack, writer) != metrics::WriterStatus::Ok) { /* refuse */ }
+
+auto r = writer.allocate(/*typeId*/ 1'000'201, metrics::MetricKind::Gauge, /*ownerTag*/ -1, key, "label text");
+if (r.status != metrics::AllocStatus::Ok) { /* fatal at startup: log the metric's name */ }
+metrics::SlotWriter slot = r.writer;                 // trivially copyable; give it to exactly one writer thread
+slot.add(1);                                         // Counter
+slot.set(42);                                        // Gauge
+(void)writer.free(slot.slot());                      // owner thread only
 ```
 
-**API**
+- `MetricsWriter::create` refuses a free-stack span shorter than `maxSlots` (`FreeStackTooSmall`) and a read-only
+  mapping from `MetricsFile::open` (`ReadOnlyFile`); it never shrinks the capacity silently.
+  It also refuses a file on which any slot was ever allocated (`FileInUse`): one writer per file, so a second
+  writer never restarts at slot 0 and regId 1 over live owners. `MetricsWriter` is move-only; a moved-from writer
+  holds nothing and every `allocate` on it returns `Full`.
+- **regId and ownerTag.** The `regId` of every allocation is the allocator's own counter: it starts at 1, increases
+  by one per successful `allocate`, and is never reused for the writer's life, so two live slots never share one and
+  a reused slot always shows a new regId. The third argument of `allocate` is an **owner tag** (`-1` means none, stored
+  as 0; below -1 is `InvalidOwnerTag`). It is stored in the metadata (`Live::ownerTag`) and may repeat across slots,
+  e.g. one namespace id for a block of slots. It is *not* a regId: 1.x-style "pass my own regId" no longer exists.
+- `allocate` checks its arguments first (`InvalidType`: negative type id or unknown kind; `KeyTooLong` above 112
+  bytes; `LabelTooLong` above 364 bytes), then takes a free slot (LIFO) or the next unused one, or returns `Full`. A
+  failed call changes nothing in the file.
+- Publication order: a release fence, then the key and label (relaxed 32-bit word stores, zero-filled), the scalars
+  (relaxed), the value zeroed (release), the regId (release), and finally the state set to `Allocated` (release). A
+  new owner never inherits the old total.
+- There is no reuse grace period: a freed slot is reused at once. Readers detect reuse by the regId, so no timing
+  constant is involved.
+- `add` wraps in two's complement across `INT64_MAX`.
 
-| Method | Description |
-|---|---|
-| `set(int64_t v)` | Set to an absolute value |
-| `inc()` | Increment by 1 |
-| `dec()` | Decrement by 1 |
-| `add(int64_t v)` | Add `v` |
-| `sub(int64_t v)` | Subtract `v` |
-| `get() -> int64_t` | Read current value |
-
----
-
-### Throughput
-
-A rate metric that measures **data transfer throughput** (bytes/sec) using a
-**sliding time window**. It is the right tool for measuring network bandwidth, disk
-I/O throughput, message rates, etc.
+## Reader
 
 ```cpp
-ThroughputMetric bw = registry.register_throughput("net_rx", 60 /* window seconds */);
+#include <metrics/MetricsReader.h>
+
+metrics::MetricsFile file;
+if (metrics::MetricsFile::open(path, /*maxVersionPolls*/ 100, file) != metrics::FileStatus::Ok) { ... }
+metrics::MetricsReader reader(file);
+
+reader.forEachLive([](const metrics::Live& l) { /* l.typeId, l.kind, l.regId, l.ownerTag, l.value, l.key(), l.label() */ });
+metrics::SlotRef ref = reader.findFirst(typeId, key);   // ref.slot == -1 if none
 ```
 
-**How it works**
+`read(slot)` returns `SlotView = std::variant<Empty, Live, Reused>`. It reads the state and regId (acquire), copies
+the scalars, the key, the label and the value out of the file into the returned `Live` (relaxed word loads), then
+issues an acquire fence and re-reads the state and the regId. A slot freed while it was being read is `Empty`; one
+reallocated while it was being read is `Reused{slot, oldRegId}`, never a `Live` that mixes two owners. **Nothing
+points into the mapping**: `Live::key()` and `Live::label()` view the copy inside the `Live` itself, so they stay
+consistent whatever the writer does next (do not keep them past the `Live`'s lifetime). `forEachLive` reads a
+`Reused` slot once more.
 
-Internally `ThroughputMetric` maintains a ring buffer of **60 per-second buckets**
-(one per calendar second of `steady_clock`). Each call to `record(bytes)`:
+`read(slot, Live& out)` does the same read into a caller's `Live` and returns `ReadStatus` (`Empty`, `Live` or
+`Reused`; on `Reused`, `out.regId` is the old owner's regId and the rest of `out` is unspecified). It avoids building
+a `SlotView` per call; `forEachLive`, `findFirst` and the samplers each reuse one stack `Live` through it.
 
-1. Atomically adds `bytes` to the current second's bucket.
-2. Resets stale buckets via a CAS when the second rolls over.
-3. At most once every **100 ms**, sums all buckets within the window, divides by
-   `window_seconds`, and stores the result (bytes/sec) into the mmap slot so readers
-   see an up-to-date rate.
+`findFirst(typeId, key)` returns `SlotRef{slot, regId}` (`{-1, -1}` if none), reading a `Reused` slot once more.
 
-The total cumulative byte count is written to a separate mmap slot on every call, so
-readers always have an exact monotonic total.
+## Rates and windows
 
-**`register_throughput` creates two mmap slots**
-
-| Slot name | Type | Description |
-|---|---|---|
-| `<name>_rate_bps` | `THROUGHPUT` | Current throughput in bytes/sec |
-| `<name>_total_bytes` | `COUNTER` | Cumulative bytes transferred (monotonic) |
-
-**API**
-
-| Method | Description |
-|---|---|
-| `record(int64_t bytes)` | Record bytes transferred; updates sliding window and throttled rate |
-| `flush()` | Force-recompute and push rate to mmap immediately |
-| `rate() -> int64_t` | Read current bytes/sec from the mmap slot |
-| `total() -> int64_t` | Read cumulative total bytes from the mmap slot |
-
-**Parameters to `register_throughput`**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `name` | — | Base name; two slots `<name>_rate_bps` and `<name>_total_bytes` are registered |
-| `window_seconds` | `60` | Width of the sliding window in seconds (1–60) |
-
----
-
-### WindowedMaxGauge
-
-Tracks the **maximum** of all samples recorded within a sliding time window.
-Purpose-built for cases where the consumer polls at a lower frequency than the
-producer: even if the exporter only wakes once per second, it will see the true peak
-of every sample recorded during that interval.
+`RateTracker<Capacity, Window>` and `WindowSampler<Capacity, Window>` keep a fixed array with one entry per slot
+(no allocation). An entry restarts when its regId changes, its slot is freed, or its total goes backwards, so a rate
+never spans two owners. A tracker is bound to a reader's file with `bind(reader)`, which refuses (`CapacityTooSmall`,
+the tracker stays unbound and samples nothing) a `Capacity` below the file's slot count instead of truncating.
 
 ```cpp
-// Sensor runs at 10 Hz; exporter at 1 Hz; window = 10 s
-WindowedMaxGauge peak_temp = registry.register_windowed_max("cpu_temp_max_C", 10);
+metrics::RateTracker<4096, 60> rates;
+if (rates.bind(reader) != metrics::TrackerStatus::Ok) { /* capacity below the file's slots */ }
+rates.sample(reader, nowNs);                         // call at your own period
+std::optional<double> perSecond = rates.perSecond(slot);   // none until two samples, none for a reused slot
+std::optional<double> forOwner = rates.perSecond(slot, regId);   // only if that regId is the one being tracked
+
+metrics::WindowSampler<4096, 60> window;
+(void)window.bind(reader);                           // same capacity rule as RateTracker
+window.sample(reader, nowNs);
+std::optional<int64_t> peak = window.max(slot);      // max of the last Window sampled levels
+std::optional<double> mean = window.avg(slot);       // mean of the last Window samples
 ```
 
-**How it works**
+A windowed max is the max of the *sampled* levels. A writer that needs an exact peak keeps its own `Gauge` high-water
+mark and resets it on its own schedule.
 
-Internally maintains a circular buffer of `(timestamp_ms, value)` pairs. On every
-`update()`:
+## Prometheus text
 
-1. The new sample is appended to the ring buffer.
-2. Samples older than `window_seconds` are evicted from the front.
-3. The maximum of the remaining samples is computed and written atomically to the
-   mmap slot so readers see a fresh value immediately.
-
-An internal `std::mutex` serialises writes. At ≤ 100 Hz this adds ~100 ns of
-latency per call in the worst case; for the stated 10 Hz use case the overhead is
-negligible.
-
-**API**
-
-| Method | Description |
-|---|---|
-| `update(int64_t val)` | Record a sample; evicts expired samples and updates the mmap slot |
-| `get() -> int64_t` | Lock-free read of the current windowed maximum from the mmap slot |
-
-**Parameters to `register_windowed_max`**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `name` | — | Metric name registered in the mmap |
-| `window_seconds` | `10` | Width of the sliding window |
-| `capacity` | `1024` | Ring buffer depth. Must satisfy `capacity ≥ sample_rate_hz × window_seconds` |
-
-Returns 0 when no samples are in the window.
-
----
-
-### WindowedAvgGauge
-
-Tracks the **average** of all samples recorded within a sliding time window.
-Use it to smooth a noisy high-frequency signal before it reaches a low-frequency
-exporter.
+The caller samples once per scrape; `render` only reads:
 
 ```cpp
-// Sensor runs at 10 Hz; exporter at 1 Hz; window = 10 s → average over last 100 samples
-WindowedAvgGauge avg_latency = registry.register_windowed_avg("rpc_latency_us", 10);
+rates.sample(reader, nowNs);
+metrics::RenderResult r = metrics::PrometheusText::render(reader, rates, std::span<char>(buf));
+if (r.overflow) { /* buf was too small: its content is unspecified; retry with a bigger buffer */ }
+else            { /* buf[0 .. r.length) is the exposition text */ }
 ```
 
-**How it works**
-
-Identical ring-buffer design as `WindowedMaxGauge`. On every `update()` the window
-sum is divided by the sample count and stored in the mmap slot as an `int64_t`
-(integer average, truncated). If sub-integer precision is required, scale inputs
-before calling `update()` — for example, pass values in micro-units and divide by
-1 000 in the reader.
-
-**API**
-
-| Method | Description |
-|---|---|
-| `update(int64_t val)` | Record a sample; evicts expired samples and updates the mmap slot |
-| `get() -> int64_t` | Lock-free read of the current windowed average from the mmap slot |
-
-**Parameters to `register_windowed_avg`**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `name` | — | Metric name registered in the mmap |
-| `window_seconds` | `10` | Width of the sliding window |
-| `capacity` | `1024` | Ring buffer depth. Must satisfy `capacity ≥ sample_rate_hz × window_seconds` |
-
-Returns 0 when no samples are in the window.
-
----
-
-## MetricsRegistry
-
-`MetricsRegistry` manages the mmap file. It is **move-only** and cannot be copied.
-
-### Creating a registry (producer)
-
-```cpp
-auto registry = MetricsRegistry::create("/run/myapp/metrics.mmap");
-```
-
-`create()` opens the file with `O_CREAT | O_TRUNC`, acquires an exclusive `flock`
-during initialization, writes the header, then downgrades to a shared lock so readers
-can attach immediately.
-
-| Parameter | Default | Description |
-|---|---|---|
-| `path` | — | Path to the mmap file (created if absent, truncated if present) |
-| `max_metrics` | `4096` | Maximum number of mmap slots to pre-allocate |
-
-### Opening a registry (reader)
-
-```cpp
-auto registry = MetricsRegistry::open("/run/myapp/metrics.mmap");
-```
-
-`open()` opens the file read-only, acquires a shared `flock` (blocks until the
-producer finishes initialization), validates the magic number and version, then maps
-the file. Readers cannot register metrics.
-
-### Registering metrics
-
-Registration is only permitted on the owner (created with `create()`). It is
-**not thread-safe** — register all metrics during startup before spawning worker
-threads.
-
-```cpp
-auto requests   = registry.register_counter("http_requests_total");
-auto queue_len  = registry.register_gauge("queue_length");
-auto bandwidth  = registry.register_throughput("net_tx_bytes", 30);
-auto peak_temp  = registry.register_windowed_max("cpu_temp_max_C", 10);
-auto avg_lat    = registry.register_windowed_avg("rpc_latency_us",  10);
-```
-
-### Exporter / reader API
-
-```cpp
-uint32_t            n    = registry.metric_count();
-const MetricMeta*   meta = registry.metadata();   // array of n entries
-const ValueSlot*    vals = registry.values();      // array of n entries
-
-for (uint32_t i = 0; i < n; ++i) {
-    if (!meta[i].active) continue;
-    int64_t v = vals[meta[i].value_offset].value.load(std::memory_order_relaxed);
-    // All metric types expose a single int64_t value in the mmap slot:
-    //   COUNTER       - cumulative count
-    //   GAUGE         - current value
-    //   THROUGHPUT    - bytes/sec (the _rate_bps slot)
-    //   WINDOWED_MAX  - peak sample in the window
-    //   WINDOWED_AVG  - average sample in the window
-    // emit meta[i].name, meta[i].type, v  ...
-}
-```
-
----
-
-## Usage Examples
-
-### Producer process
-
-```cpp
-#include <metrics/Metrics.h>
-#include <thread>
-
-int main() {
-    auto registry = MetricsRegistry::create("/run/myapp/metrics.mmap");
-
-    auto requests  = registry.register_counter("http_requests_total");
-    auto errors    = registry.register_counter("http_errors_total");
-    auto queue_len = registry.register_gauge("queue_length");
-    auto bandwidth = registry.register_throughput("net_tx_bytes", 60);
-
-    // --- worker loop ---
-    while (true) {
-        // simulate work
-        requests.inc();
-        queue_len.set(42);
-
-        // record 1400 bytes sent (e.g. one Ethernet frame payload)
-        bandwidth.record(1400);
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
-```
-
-### Reader / exporter process
-
-```cpp
-#include <metrics/Metrics.h>
-#include <cstdio>
-
-int main() {
-    auto registry = MetricsRegistry::open("/run/myapp/metrics.mmap");
-
-    while (true) {
-        uint32_t          n    = registry.metric_count();
-        const MetricMeta* meta = registry.metadata();
-        const ValueSlot*  vals = registry.values();
-
-        for (uint32_t i = 0; i < n; ++i) {
-            if (!meta[i].active) continue;
-            int64_t v = vals[meta[i].value_offset].value.load(std::memory_order_relaxed);
-            std::printf("# TYPE %s %s\n%s %ld\n",
-                meta[i].name,
-                meta[i].type == MetricType::COUNTER   ? "counter" :
-                meta[i].type == MetricType::GAUGE      ? "gauge"   :
-                meta[i].type == MetricType::THROUGHPUT ? "gauge"   : "untyped",
-                meta[i].name, v);
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(15));
-    }
-}
-```
-
-### Measuring network bandwidth
-
-```cpp
-#include <metrics/Metrics.h>
-
-class NetworkSender {
-public:
-    explicit NetworkSender(MetricsRegistry& reg)
-        : tx_(reg.register_throughput("net_tx_bytes", 60))
-        , rx_(reg.register_throughput("net_rx_bytes", 60)) {}
-
-    void send(const void* buf, size_t len) {
-        // ... actual send syscall ...
-        tx_.record(static_cast<int64_t>(len));
-    }
-
-    void recv(const void* buf, size_t len) {
-        // ... actual recv syscall ...
-        rx_.record(static_cast<int64_t>(len));
-    }
-
-    // Call periodically (e.g. from a stats thread) to guarantee freshness
-    // even when traffic is very low.
-    void flush_stats() {
-        tx_.flush();
-        rx_.flush();
-    }
-
-    // Read current bandwidth (bytes/sec) without touching the mmap file.
-    int64_t tx_bps() const { return tx_.rate(); }
-    int64_t rx_bps() const { return rx_.rate(); }
-
-private:
-    ThroughputMetric tx_;
-    ThroughputMetric rx_;
-};
-```
-
-A reader seeing the mmap file will find slots named `net_tx_bytes_rate_bps`,
-`net_tx_bytes_total_bytes`, `net_rx_bytes_rate_bps`, and `net_rx_bytes_total_bytes`.
-
----
-
-### 10 Hz sensor with 1 Hz exporter
-
-The scenario that motivated `WindowedMaxGauge` and `WindowedAvgGauge`: a sensor
-produces 10 samples per second but the Prometheus exporter scrapes once per second.
-A plain `GaugeMetric` would show only the most recent sample, losing the other 9.
-The windowed types retain all samples and expose the statistic the exporter cares
-about.
-
-```cpp
-#include <metrics/Metrics.h>
-#include <thread>
-#include <cmath>
-
-int main() {
-    auto registry = MetricsRegistry::create("/run/myapp/metrics.mmap");
-
-    // 10 s window: at 10 Hz that's 100 samples retained
-    auto peak_temp  = registry.register_windowed_max("cpu_temp_max_mC",  10);
-    auto avg_temp   = registry.register_windowed_avg("cpu_temp_avg_mC",  10);
-    auto peak_rtt   = registry.register_windowed_max("rtt_max_us",       10);
-    auto avg_rtt    = registry.register_windowed_avg("rtt_avg_us",       10);
-
-    // Sensor loop at 10 Hz
-    while (true) {
-        int64_t temp_mC = read_cpu_temp_milli_celsius();  // e.g. 52'300
-        int64_t rtt_us  = measure_rtt_microseconds();     // e.g. 420
-
-        peak_temp.update(temp_mC);
-        avg_temp.update(temp_mC);
-        peak_rtt.update(rtt_us);
-        avg_rtt.update(rtt_us);
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 10 Hz
-    }
-    // Exporter (separate process, 1 Hz) reads peak_temp and avg_temp slots
-    // and sees the true max / average across all 10 samples of the last 10 s.
-}
-```
-
-**Sizing the ring buffer**
+`render` writes each family once, straight into the buffer (no count pass, so the length cannot disagree with the
+text). `length` is the number of bytes written and never exceeds the buffer. It opens no sockets and allocates
+nothing. A rate is printed only when the tracker's entry has the same regId as the live slot.
 
 ```
-capacity ≥ sample_rate_hz × window_seconds
-         = 10 Hz × 10 s = 100 samples          (default 1024 is ample)
+# HELP metrics_counter Monotonic total of a slot, by type id, registration id and label.
+# TYPE metrics_counter counter
+metrics_counter{type="1000201",reg_id="1",label="node=\"1\""} 3500
+# HELP metrics_gauge Level of a slot, by type id, registration id and label.
+# TYPE metrics_gauge gauge
+metrics_gauge{type="5",reg_id="2",label="..."} -7
+# HELP metrics_rate_per_second Per-second rate of a counter between the reader's last two samples.
+# TYPE metrics_rate_per_second gauge
+metrics_rate_per_second{type="1000201",reg_id="1",label="node=\"1\""} 2500
 ```
 
-If you later increase to 100 Hz or a 60-second window, pass an explicit capacity:
+The label text is emitted as one quoted label value (backslash, quote and newline escaped).
 
-```cpp
-auto metric = registry.register_windowed_max("name", 60, /*capacity=*/8192);
-```
+## SystemMetrics
 
----
+`metrics::SystemMetrics` publishes `process_open_fds`, `process_threads`, `process_resident_memory_bytes` and
+`process_virtual_memory_bytes` gauges, and a `process_metrics_read_errors_total` counter. It starts no thread: the
+owner calls `doWork(nowNs)` on its duty cycle, and the call returns 0 at once until `intervalNs` has passed on that
+clock. `statm`, `status` and the `fd` directory are opened once in `init` and re-read with `pread` and `getdents64`
+into fixed buffers. A source that fails to read keeps its last value and counts one read error. `procRoot` is
+injectable (`"/proc/self"`) for tests; a root longer than the path buffer is refused at `init`. The open-fd count
+excludes the directory fd that `SystemMetrics` itself holds. **Type ids `1'000'301..1'000'305` are reserved for
+`SystemMetrics`** (open fds, threads, resident bytes, virtual bytes, read errors); Rune's own block is
+`1'000'201..1'000'241`.
 
-## Thread Safety
+## Capacity
 
-| Operation | Thread-safe? | Notes |
-|---|---|---|
-| `CounterMetric::inc` / `add` / `get` | Yes | Lock-free atomic |
-| `GaugeMetric::set` / `inc` / `dec` / `add` / `sub` / `get` | Yes | Lock-free atomic |
-| `ThroughputMetric::record` / `flush` / `rate` / `total` | Yes | Lock-free; CAS-based bucket reset |
-| `WindowedMaxGauge::update` | Yes | Mutex-serialised write; lock-free `get()` |
-| `WindowedAvgGauge::update` | Yes | Mutex-serialised write; lock-free `get()` |
-| `MetricsRegistry::register_*` | **No** | Call only from a single thread at startup |
-| `MetricsRegistry::open` / `create` | Yes (independent instances) | Each call returns a separate instance |
-
-The metric update path (`record`, `inc`, `add`, etc.) uses `memory_order_relaxed`
-throughout. This is intentional: metrics do not need strict ordering with application
-logic. The trade-off is that a reader process may observe values that lag by one or
-two CPU store-buffer flushes — which is entirely acceptable for monitoring.
-
-`WindowedMaxGauge` and `WindowedAvgGauge` use a `std::mutex` to serialise concurrent
-`update()` calls. The lock is held only during ring-buffer insertion and the linear
-scan to compute max/avg (O(window_samples)). At 10 Hz with a 10-second window (100
-samples) this is a sub-microsecond critical section.
-
----
-
-## Memory Layout
+`requiredSlots(plan)` returns an `int64_t`:
 
 ```
-Offset 0                      sizeof(MetricsHeader) = 64 B
-├── MetricsHeader
-
-Offset 64                     max_metrics × sizeof(MetricMeta) = max_metrics × 256 B
-├── MetricMeta[0]
-├── MetricMeta[1]
-└── …
-
-Offset 64 + max_metrics×256   max_metrics × sizeof(ValueSlot) = max_metrics × 64 B
-├── ValueSlot[0]
-├── ValueSlot[1]
-└── …
+requiredSlots = nodeMetrics + maxNamespaces * (perThreadNsMetrics * threads + perNodeNsMetrics) + headroom
 ```
 
-Default total size with `max_metrics = 4096`:
+`headroom` (Rune uses 16) covers `SystemMetrics` and future node metrics. The product can pass `INT32_MAX`; the caller
+checks. `MetricsFile::create` refuses with `CapacityTooLarge` above `INT32_MAX` and `CapacityTooSmall` when
+`maxSlots < requiredSlots`, so a node refuses to start instead of dropping a metric later.
+
+## Using it from Rune
+
+Rune owns one file per node (`RUNE_METRICS_FILE`, default `${RUNE_DATA_DIR}/metrics/rune-metrics.dat`, directory mode
+0750, file mode 0640). Every node metric is allocated before any agent thread starts, so each writer receives a valid
+`SlotWriter`; an allocation failure aborts the start with the metric's name. The control agent calls
+`SystemMetrics::doWork(nowNs)`. `rune_role` and the test rigs are readers: a missing file is an error, never a silent
+fallback.
+
+## Migrating from 1.x
+
+2.0.0 removes the 1.x API (`MetricsRegistry`, `CounterMetric`, `GaugeMetric`, `ThroughputMetric`,
+`WindowedMaxGauge`, `WindowedAvgGauge`, and the `SystemMetrics` thread). A v1 file is refused with `VersionMismatch`.
+
+| 1.x | 2.0.0 |
+| --- | --- |
+| `MetricsRegistry::create(path, n)` (`O_TRUNC`, `flock` wait loop, throws) | `MetricsFile::create(params, out)` (tmp + rename, status code) |
+| `MetricsRegistry::open(path)` | `MetricsFile::open(path, polls, out)` + `MetricsReader` |
+| `register_counter(name)` / `register_gauge(name)` | `MetricsWriter::allocate(typeId, kind, ownerTag, key, label)` (regId is assigned) |
+| `CounterMetric::increment` (`fetch_add`) | `SlotWriter::add` (load, add, release store) |
+| `GaugeMetric::set` | `SlotWriter::set` |
+| `ThroughputMetric`, `WindowedMaxGauge`, `WindowedAvgGauge` (writer-side, own clock) | `RateTracker`, `WindowSampler` (reader-side, caller's `nowNs`) |
+| `SystemMetrics` with its own thread | `SystemMetrics::doWork(nowNs)` on the owner's duty cycle |
+| metric names with labels in a string | `typeId` + `key` bytes + `label` text |
+| exporter reading the registry | `PrometheusText::render` |
+
+## Build, test and benchmark
 
 ```
-64 + 4096×256 + 4096×64 = 64 + 1,048,576 + 262,144 ≈ 1.25 MB
+cmake -S . -B build -G Ninja -DMETRICS_BUILD_TESTS=ON -DMETRICS_BUILD_BENCH=ON
+cmake --build build
+ctest --test-dir build --output-on-failure -j8
+# sanitizers
+cmake -S . -B build-asan -G Ninja -DMETRICS_BUILD_TESTS=ON -DMETRICS_SANITIZE=address,undefined
+cmake -S . -B build-tsan -G Ninja -DMETRICS_BUILD_TESTS=ON -DMETRICS_SANITIZE=thread
 ```
 
----
+CMake 3.31 or newer; googletest 1.16.0 and Google Benchmark 1.8.2 are fetched. Every test is a `*Regression*`
+test. The tests advance an injected clock and never sleep.
 
-## Build & Integration
+Benchmark (`bench/MetricsBench.cpp`, Release, gcc, one shared host with load average about 5, so read the
+numbers as upper bounds):
 
-### CMake (via Conan)
+| Benchmark | Time |
+| --- | --- |
+| `SlotWriter::add` | about 0.45 ns (a single store; the loop is hoisted) |
+| `SlotWriter::set` | about 0.47 ns |
+| `MetricsReader::read(slot)` | about 33 ns (builds the 536-byte `SlotView`, holding a 528-byte `Live`, in place) |
+| `MetricsReader::read(slot, Live&)` | about 25 ns (fills a caller's `Live`; `forEachLive` and the samplers use it) |
+| `forEachLive` over 4096 slots | about 100 us |
+| `RateTracker::sample` over 4096 slots | about 115 us |
 
-```bash
-# From the repo root
-./build.sh          # builds, packages, and uploads to Artifactory
-```
+## Packaging
 
-### CMake consumer
-
-```cmake
-find_package(metrics REQUIRED)
-target_link_libraries(my_target PRIVATE metrics)
-```
-
-### Conan consumer
-
-```python
-# conanfile.py
-def requirements(self):
-    self.requires("metrics/1.0.0@vradu/dev")
-```
-
-### Requirements
-
-- C++23 compiler (GCC 13+, Clang 16+, MSVC 19.36+)
-- POSIX platform (Linux, macOS) — uses `mmap`, `flock`, `ftruncate`
-- No external runtime dependencies
+CI builds and tests the library (gcc-13 and clang-18, Debug, ASan+UBSan and TSan, plus a Release bench smoke). CI
+publishes the package; there are no local conan steps.

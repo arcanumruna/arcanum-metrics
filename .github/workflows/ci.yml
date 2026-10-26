@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.compiler.name }} ${{ matrix.config.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - { name: gcc-13, cc: gcc-13, cxx: g++-13 }
+          - { name: clang-18, cc: clang-18, cxx: clang++-18 }
+        config:
+          - { name: debug, sanitize: "", build_type: Debug }
+          - { name: asan-ubsan, sanitize: "address,undefined", build_type: Debug }
+          - { name: tsan, sanitize: "thread", build_type: Debug }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CMake 3.31 or newer
+        run: pip install cmake
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ${{ matrix.compiler.cxx == 'clang++-18' && 'clang-18' || 'g++-13' }}
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.config.build_type }}
+          -DCMAKE_C_COMPILER=${{ matrix.compiler.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler.cxx }}
+          -DMETRICS_BUILD_TESTS=ON
+          -DMETRICS_SANITIZE=${{ matrix.config.sanitize }}
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j4 --repeat until-fail:5
+
+  bench-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CMake 3.31 or newer
+        run: pip install cmake
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build g++-13
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=g++-13
+          -DMETRICS_BUILD_BENCH=ON
+      - name: Build
+        run: cmake --build build
+      - name: Bench smoke
+        run: ./build/bench/MetricsBench --benchmark_min_time=0.01s

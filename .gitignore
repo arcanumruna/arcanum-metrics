@@ -1,10 +1,12 @@
 # --- Conan and build artifacts ---
 /build/
+/build-*/
 /cmake-build-*/
 .conan/
 /conan-release/
 /.buildkit-cache/
 *.cmake
+!cmake/*.cmake
 CMakeFiles/
 CMakeCache.txt
 *.ninja

@@ -1,0 +1,234 @@
+#pragma once
+// Owner-thread allocator and single-writer slot handles. No allocation, no exceptions, no locks.
+//  - SlotWriter: one writer thread per slot; plain load of its own value, add, release store.
+//  - MetricsWriter: allocate and free run on one owner thread (the allocator's), never concurrently.
+#include "metrics/MetricsFile.h"
+#include "metrics/MetricsLayout.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <string_view>
+
+namespace metrics {
+
+enum class AllocStatus : int32_t { Ok, Full, KeyTooLong, LabelTooLong, InvalidType, InvalidOwnerTag };
+enum class FreeStatus : int32_t { Ok, NotAllocated, OutOfRange };
+enum class WriterStatus : int32_t { Ok, FreeStackTooSmall, ReadOnlyFile, FileInUse };
+
+class SlotWriter {  // trivially copyable value type; exactly one writer thread per slot
+public:
+    SlotWriter() noexcept = default;
+    SlotWriter(int64_t* value, int32_t slot) noexcept : value_(value), slot_(slot) {}
+
+    void add(int64_t n) const noexcept {
+#ifdef METRICS_TEST_PLAIN_STORE  // mutation switch for the TSan stress test: a non-atomic store
+        *value_ = static_cast<int64_t>(static_cast<uint64_t>(*value_) + static_cast<uint64_t>(n));
+        return;
+#endif
+        std::atomic_ref<int64_t> ref(*value_);
+        // Unsigned arithmetic: wraps in two's complement instead of signed-overflow UB.
+        ref.store(static_cast<int64_t>(static_cast<uint64_t>(ref.load(std::memory_order_relaxed)) +
+                                       static_cast<uint64_t>(n)),
+                  std::memory_order_release);
+    }
+    void set(int64_t v) const noexcept {
+#ifdef METRICS_TEST_PLAIN_STORE
+        *value_ = v;
+        return;
+#endif
+        std::atomic_ref<int64_t>(*value_).store(v, std::memory_order_release);
+    }
+    [[nodiscard]] int64_t get() const noexcept {
+        return std::atomic_ref<int64_t>(*value_).load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] int32_t slot() const noexcept { return slot_; }
+
+private:
+    int64_t* value_ = nullptr;
+    int32_t slot_ = -1;
+};
+
+struct AllocResult {
+    AllocStatus status;
+    SlotWriter writer;
+    int64_t regId;
+};
+
+// Publication steps, for deterministic tests (a hook called between the stores). The default hook is empty.
+enum class AllocStep : int32_t { Metadata, Zeroed, RegId, Published };
+struct NoHook {
+    void operator()(AllocStep, int32_t) const noexcept {}
+};
+
+template <class Hook = NoHook>
+class BasicMetricsWriter {  // owner thread only
+public:
+    // An unbound writer: every allocate returns Full. Use create().
+    BasicMetricsWriter() noexcept = default;
+
+    // Move-only. A copy would share the file and the free stack but keep its own counters, so two writers would
+    // hand out the same slot and regId. A moved-from writer holds no file and no stack: allocate returns Full.
+    BasicMetricsWriter(const BasicMetricsWriter&) = delete;
+    BasicMetricsWriter& operator=(const BasicMetricsWriter&) = delete;
+    BasicMetricsWriter(BasicMetricsWriter&& other) noexcept { takeFrom(other); }
+    BasicMetricsWriter& operator=(BasicMetricsWriter&& other) noexcept {
+        if (this != &other) takeFrom(other);
+        return *this;
+    }
+
+    // freeStackStorage must hold maxSlots entries (a free slot is pushed at most once); a shorter span is refused
+    // rather than silently shrinking the capacity. A read-only mapping (MetricsFile::open) is refused too.
+    // A file on which any slot was ever allocated (Allocated or Freed) is refused with FileInUse: a new writer
+    // would restart at slot 0 and regId 1, clobbering a live owner and reissuing its regId.
+    // On a refusal `out` is left unbound.
+    [[nodiscard]] static WriterStatus create(MetricsFile& file, std::span<int32_t> freeStackStorage,
+                                             BasicMetricsWriter& out, Hook hook = Hook{}) noexcept {
+        out = BasicMetricsWriter{};
+        if (file.base() == nullptr || !file.writable()) return WriterStatus::ReadOnlyFile;
+        if (freeStackStorage.size() < static_cast<size_t>(file.layout().maxSlots)) return WriterStatus::FreeStackTooSmall;
+        // Create path only, never the hot path: one acquire load per slot, bounded by the capacity, stopping at
+        // the first slot that is not Unused.
+        const FileLayout layout = file.layout();
+        for (int32_t s = 0; s < layout.maxSlots; ++s) {
+            std::byte* m = file.base() + layout.metadataOffset() + int64_t{s} * kMetadataRecordLength;
+            if (ref32(m, kMetaStateOffset).load(std::memory_order_acquire) != static_cast<int32_t>(SlotState::Unused)) {
+                return WriterStatus::FileInUse;
+            }
+        }
+        out.base_ = file.base();
+        out.layout_ = file.layout();
+        out.capacity_ = file.layout().maxSlots;
+        out.freeStack_ = freeStackStorage.data();
+        out.hook_ = hook;
+        return WriterStatus::Ok;
+    }
+
+    [[nodiscard]] AllocResult allocate(int32_t typeId, MetricKind kind, int64_t ownerTag /* -1 = none, stored as 0 */,
+                                       std::span<const std::byte> key, std::string_view label) noexcept {
+        // Argument checks first, in this order; none of them touches the file.
+        if (typeId < 0 || (kind != MetricKind::Counter && kind != MetricKind::Gauge)) return fail(AllocStatus::InvalidType);
+        if (ownerTag < -1) return fail(AllocStatus::InvalidOwnerTag);
+        if (key.size() > static_cast<size_t>(kMaxKeyLength)) return fail(AllocStatus::KeyTooLong);
+        if (label.size() > static_cast<size_t>(kMaxLabelLength)) return fail(AllocStatus::LabelTooLong);
+
+        int32_t slot;
+        if (freeCount_ > 0) {
+            slot = freeStack_[freeCount_ - 1];
+        } else if (nextUnused_ < capacity_) {
+            slot = nextUnused_;
+        } else {
+            return fail(AllocStatus::Full);
+        }
+        if (freeCount_ > 0) --freeCount_; else ++nextUnused_;
+
+        // The regId is always the allocator's own counter: unique for the writer's whole life, never reused. The
+        // caller's number is only a tag (Phase 2: the namespace id) and may repeat across live slots.
+        const int64_t id = nextRegId_++;
+        std::byte* m = meta(slot);
+
+        // Order the earlier Freed store before every store below: a reader that sees any of the new owner's
+        // bytes must then also see the slot is no longer the old owner's (its acquire fence pairs with this).
+        std::atomic_thread_fence(std::memory_order_release);
+
+        // Key and label are written as relaxed 32-bit words so a reader copying them concurrently is race-free;
+        // the zero fill is part of the same stores.
+        storeWords(m + kMetaKeyOffset, kMaxKeyLength, key.data(), key.size());
+        storeWords(m + kMetaLabelOffset, kMaxLabelLength, label.data(), label.size());
+        putPlain(m, kMetaKeyLengthOffset, static_cast<int32_t>(key.size()));
+        putPlain(m, kMetaLabelLengthOffset, static_cast<int32_t>(label.size()));
+        putPlain(m, kMetaTypeIdOffset, typeId);
+        putPlain(m, kMetaKindOffset, static_cast<int32_t>(kind));
+        putPlain(m, kMetaOwnerTagOffset, ownerTag < 0 ? int64_t{0} : ownerTag);
+        hook_(AllocStep::Metadata, slot);
+
+        int64_t* v = value(slot);
+        std::atomic_ref<int64_t>(*v).store(0, std::memory_order_release);  // a new owner never inherits the total
+        hook_(AllocStep::Zeroed, slot);
+
+        ref64(m, kMetaRegIdOffset).store(id, std::memory_order_release);
+        hook_(AllocStep::RegId, slot);
+
+        ref32(m, kMetaStateOffset).store(static_cast<int32_t>(SlotState::Allocated), std::memory_order_release);
+        hook_(AllocStep::Published, slot);
+
+        ++allocated_;
+        return AllocResult{AllocStatus::Ok, SlotWriter(v, slot), id};
+    }
+
+    [[nodiscard]] FreeStatus free(int32_t slot) noexcept {
+        if (slot < 0 || slot >= capacity_) return FreeStatus::OutOfRange;
+        std::byte* m = meta(slot);
+        if (ref32(m, kMetaStateOffset).load(std::memory_order_relaxed) != static_cast<int32_t>(SlotState::Allocated)) {
+            return FreeStatus::NotAllocated;
+        }
+        ref32(m, kMetaStateOffset).store(static_cast<int32_t>(SlotState::Freed), std::memory_order_release);
+        freeStack_[freeCount_++] = slot;
+        --allocated_;
+        return FreeStatus::Ok;
+    }
+
+    [[nodiscard]] int32_t allocatedCount() const noexcept { return allocated_; }
+
+private:
+    static AllocResult fail(AllocStatus s) noexcept { return AllocResult{s, SlotWriter(), -1}; }
+    void takeFrom(BasicMetricsWriter& o) noexcept {
+        base_ = o.base_;
+        layout_ = o.layout_;
+        capacity_ = o.capacity_;
+        freeStack_ = o.freeStack_;
+        hook_ = o.hook_;
+        freeCount_ = o.freeCount_;
+        nextUnused_ = o.nextUnused_;
+        allocated_ = o.allocated_;
+        nextRegId_ = o.nextRegId_;
+        o.base_ = nullptr;  // the source is left empty: no file, no stack, nothing to hand out
+        o.layout_ = FileLayout{0};
+        o.capacity_ = 0;
+        o.freeStack_ = nullptr;
+        o.freeCount_ = 0;
+        o.nextUnused_ = 0;
+        o.allocated_ = 0;
+    }
+    std::byte* meta(int32_t slot) const noexcept {
+        return base_ + layout_.metadataOffset() + int64_t{slot} * kMetadataRecordLength;
+    }
+    int64_t* value(int32_t slot) const noexcept {
+        return reinterpret_cast<int64_t*>(base_ + layout_.valuesOffset() + int64_t{slot} * kValueRecordLength);
+    }
+    static void storeWords(std::byte* region, int32_t regionLength, const void* src, size_t n) noexcept {
+        for (int32_t off = 0; off < regionLength; off += 4) {
+            uint32_t w = 0;
+            const size_t have = n > static_cast<size_t>(off) ? std::min<size_t>(4, n - static_cast<size_t>(off)) : 0;
+            if (have != 0) std::memcpy(&w, static_cast<const std::byte*>(src) + off, have);
+            std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(region + off)).store(w, std::memory_order_relaxed);
+        }
+    }
+    // Scalar metadata is stored relaxed through atomic_ref: a reader may scan a slot while it is reused.
+    // The release store of the regId and the state publishes it.
+    static void putPlain(std::byte* m, int32_t off, int32_t v) noexcept { ref32(m, off).store(v, std::memory_order_relaxed); }
+    static void putPlain(std::byte* m, int32_t off, int64_t v) noexcept { ref64(m, off).store(v, std::memory_order_relaxed); }
+    static std::atomic_ref<int32_t> ref32(std::byte* m, int32_t off) noexcept {
+        return std::atomic_ref<int32_t>(*reinterpret_cast<int32_t*>(m + off));
+    }
+    static std::atomic_ref<int64_t> ref64(std::byte* m, int32_t off) noexcept {
+        return std::atomic_ref<int64_t>(*reinterpret_cast<int64_t*>(m + off));
+    }
+
+    std::byte* base_ = nullptr;
+    FileLayout layout_{0};
+    int32_t capacity_ = 0;
+    int32_t* freeStack_ = nullptr;
+    Hook hook_{};
+    int32_t freeCount_ = 0;
+    int32_t nextUnused_ = 0;
+    int32_t allocated_ = 0;
+    int64_t nextRegId_ = 1;
+};
+
+using MetricsWriter = BasicMetricsWriter<NoHook>;
+
+}  // namespace metrics
