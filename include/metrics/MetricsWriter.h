@@ -90,11 +90,11 @@ public:
         std::memset(m + kMetaKeyOffset + key.size(), 0, kMaxKeyLength - key.size());
         std::memcpy(m + kMetaLabelOffset, label.data(), label.size());
         std::memset(m + kMetaLabelOffset + label.size(), 0, kMaxLabelLength - label.size());
-        putPlain<int32_t>(m, kMetaKeyLengthOffset, static_cast<int32_t>(key.size()));
-        putPlain<int32_t>(m, kMetaLabelLengthOffset, static_cast<int32_t>(label.size()));
-        putPlain<int32_t>(m, kMetaTypeIdOffset, typeId);
-        putPlain<int32_t>(m, kMetaKindOffset, static_cast<int32_t>(kind));
-        putPlain<int64_t>(m, kMetaOwnerTagOffset, 0);
+        putPlain(m, kMetaKeyLengthOffset, static_cast<int32_t>(key.size()));
+        putPlain(m, kMetaLabelLengthOffset, static_cast<int32_t>(label.size()));
+        putPlain(m, kMetaTypeIdOffset, typeId);
+        putPlain(m, kMetaKindOffset, static_cast<int32_t>(kind));
+        putPlain(m, kMetaOwnerTagOffset, int64_t{0});
         hook_(AllocStep::Metadata, slot);
 
         int64_t* v = value(slot);
@@ -133,8 +133,10 @@ private:
     int64_t* value(int32_t slot) const noexcept {
         return reinterpret_cast<int64_t*>(base_ + layout_.valuesOffset() + int64_t{slot} * kValueRecordLength);
     }
-    template <class T>
-    static void putPlain(std::byte* m, int32_t off, T v) noexcept { std::memcpy(m + off, &v, sizeof v); }
+    // Scalar metadata is stored relaxed through atomic_ref: a reader may scan a slot while it is reused.
+    // The release store of the regId and the state publishes it.
+    static void putPlain(std::byte* m, int32_t off, int32_t v) noexcept { ref32(m, off).store(v, std::memory_order_relaxed); }
+    static void putPlain(std::byte* m, int32_t off, int64_t v) noexcept { ref64(m, off).store(v, std::memory_order_relaxed); }
     static std::atomic_ref<int32_t> ref32(std::byte* m, int32_t off) noexcept {
         return std::atomic_ref<int32_t>(*reinterpret_cast<int32_t*>(m + off));
     }

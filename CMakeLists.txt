@@ -13,6 +13,7 @@ add_library(metrics INTERFACE
         include/metrics/MetricsLayout.h
         include/metrics/MetricsFile.h
         include/metrics/MetricsWriter.h
+        include/metrics/MetricsReader.h
         include/metrics/SystemMetrics.h
 )
 
