@@ -430,41 +430,68 @@ TEST(WindowSamplerRegression, ReuseUnderSameOwnerTagRestartsRegression) {
 
 // A label is copied out with the rest of the slot and validated after the copy: a reader never pairs the label of
 // one owner with the value of another, and never races the allocator rewriting the label bytes.
+// Bounded handshake (no wall time): slot 0 "done" and slot 2 (reused) are written by main; slot 1 "ack" is written
+// by the reader thread only, with the last nonzero value it sampled. Owner c publishes value c+1 (odd: label A,
+// even: label B), and main frees and reallocates only after the reader acked c+1, so every owner is sampled while
+// the reader keeps scanning across the free / reallocate / relabel that follows.
 TEST(MetricsReaderRegression, LabelRacesReallocateRegression) {
-    Env env(2);
+    Env env(3);
     MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
-    const AllocResult done = w.allocate(30, MetricKind::Gauge, -1, {}, "done");  // slot 0, written by main only
-    (void)w.allocate(1, MetricKind::Gauge, -1, {}, "A");                          // slot 1 is the one reused
-    (void)w.free(1);
-    constexpr int kCycles = 100'000;
-    constexpr int64_t kMaxScans = 50'000'000;  // hard cap: fails instead of hanging
+    const AllocResult done = w.allocate(30, MetricKind::Gauge, -1, {}, "done");  // slot 0, main only
+    const AllocResult ack = w.allocate(31, MetricKind::Gauge, -1, {}, "ack");    // slot 1, reader thread only
+    ASSERT_EQ(ack.writer.slot(), 1);
+    (void)w.allocate(1, MetricKind::Gauge, -1, {}, "A");  // slot 2 is the one reused
+    (void)w.free(2);
+    constexpr int kCycles = 10'000;
+    constexpr int64_t kMinSeen = 1'000;
+    constexpr int64_t kMaxSpinsPerCycle = 20'000'000;  // hard cap on main's wait for one ack: fails, never hangs
+    constexpr int64_t kMaxScans = 200'000'000;         // hard cap on the reader
     int64_t mismatches = 0, seen = 0, scans = 0;
     bool sawDone = false;
+    const SlotWriter ackW = ack.writer;
     std::thread reader([&] {
         MetricsReader r(env.file);
+        int64_t acked = 0;
         while (scans < kMaxScans && !sawDone) {
             ++scans;
             r.forEachLive([&](const Live& l) {
                 if (l.typeId == 30) { sawDone = l.value == 1; return; }
-                if (l.value == 0) return;
+                if (l.typeId != 1 || l.value == 0) return;
                 ++seen;
-                const char want = l.value == 1 ? 'A' : 'B';
-                if (l.label().empty() || l.label()[0] != want || l.label().back() != want) ++mismatches;
+                const char want = (l.value & 1) != 0 ? 'A' : 'B';
+                if (l.label().size() != 64 || l.label().front() != want || l.label().back() != want) ++mismatches;
+                if (l.value > acked) { acked = l.value; ackW.set(acked); }
             });
         }
     });
-    for (int c = 0; c < kCycles; ++c) {
-        const bool a = (c & 1) == 0;
+    MetricsReader mainReader(env.file);
+    const auto ackValue = [&]() -> int64_t {
+        const SlotView v = mainReader.read(1);
+        const Live* l = std::get_if<Live>(&v);
+        return l != nullptr ? l->value : 0;
+    };
+    bool overrun = false, badAlloc = false;
+    int cycles = 0;
+    for (; cycles < kCycles && !overrun; ++cycles) {
+        const bool a = (cycles & 1) == 0;
         auto res = w.allocate(1, MetricKind::Gauge, -1, {},
                               a ? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                                 : "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
-        res.writer.set(a ? 1 : 2);
-        (void)w.free(1);
+        if (res.status != AllocStatus::Ok || res.writer.slot() != 2) { badAlloc = true; break; }  // no ASSERT: the
+        res.writer.set(cycles + 1);                                                                 // thread must join
+        for (int64_t spins = 0; ackValue() < cycles + 1;) {
+            if (++spins > kMaxSpinsPerCycle) { overrun = true; break; }
+            std::this_thread::yield();
+        }
+        if (w.free(2) != FreeStatus::Ok) { badAlloc = true; break; }
     }
     done.writer.set(1);
     reader.join();
+    ASSERT_FALSE(badAlloc) << "slot 2 was not reallocated in place at owner " << cycles;
+    ASSERT_FALSE(overrun) << "the reader did not ack owner " << cycles << " within " << kMaxSpinsPerCycle << " spins";
+    EXPECT_EQ(cycles, kCycles);
     EXPECT_TRUE(sawDone) << "reader never saw the done slot in " << scans << " scans";
-    EXPECT_GT(seen, 0);
+    EXPECT_GE(seen, kMinSeen);
     EXPECT_EQ(mismatches, 0) << "label of one owner paired with the value of another, seen " << seen;
 }
 
