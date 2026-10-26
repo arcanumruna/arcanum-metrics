@@ -12,6 +12,7 @@ add_library(metrics INTERFACE
         include/metrics/Metrics.h
         include/metrics/MetricsLayout.h
         include/metrics/MetricsFile.h
+        include/metrics/MetricsWriter.h
         include/metrics/SystemMetrics.h
 )
 
@@ -28,6 +29,14 @@ add_library(metrics_dummy STATIC
 target_include_directories(metrics_dummy PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+# Configure-time guard: no fetch_add / compare_exchange / mutex in the headers.
+execute_process(COMMAND ${CMAKE_COMMAND} -DHEADER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/include/metrics
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckNoAtomicRmw.cmake
+        RESULT_VARIABLE _rmw_rc ERROR_VARIABLE _rmw_err)
+if(NOT _rmw_rc EQUAL 0)
+    message(FATAL_ERROR "${_rmw_err}")
+endif()
 
 if(METRICS_SANITIZE)
     add_compile_options(-fsanitize=${METRICS_SANITIZE} -fno-omit-frame-pointer)
