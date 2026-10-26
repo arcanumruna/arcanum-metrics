@@ -5,7 +5,7 @@ find_package(Threads REQUIRED)
 # so it may be included in exactly one translation unit per executable.
 function(metrics_add_test name)
     add_executable(${name} ${name}.cpp)
-    target_link_libraries(${name} PRIVATE metrics GTest::gtest_main)
+    target_link_libraries(${name} PRIVATE metrics GTest::gtest_main Threads::Threads)
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     gtest_discover_tests(${name})
 endfunction()

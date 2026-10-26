@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace metrics;
@@ -68,9 +69,9 @@ TEST(MetricsReaderRegression, ReadStatesTable) {
     EXPECT_EQ(l.regId, a.regId);
     EXPECT_EQ(l.ownerTag, 9);
     EXPECT_EQ(l.value, -5);
-    ASSERT_EQ(l.key.size(), 4U);
-    EXPECT_EQ(l.key[0], std::byte{0x11});
-    EXPECT_EQ(l.label, "lab");
+    ASSERT_EQ(l.key().size(), 4U);
+    EXPECT_EQ(l.key()[0], std::byte{0x11});
+    EXPECT_EQ(l.label(), "lab");
     EXPECT_TRUE(std::holds_alternative<Empty>(r.read(1)));  // freed
     EXPECT_TRUE(std::holds_alternative<Empty>(r.read(2)));  // unused
     EXPECT_TRUE(std::holds_alternative<Empty>(r.read(-1)));
@@ -423,4 +424,85 @@ TEST(WindowSamplerRegression, ReuseUnderSameOwnerTagRestartsRegression) {
     ws->sample(r, 2);
     EXPECT_EQ(*ws->max(0), 1);  // not 200: the window restarted for the new owner
     EXPECT_DOUBLE_EQ(*ws->avg(0), 1.0);
+}
+
+// A label is copied out with the rest of the slot and validated after the copy: a reader never pairs the label of
+// one owner with the value of another, and never races the allocator rewriting the label bytes.
+TEST(MetricsReaderRegression, LabelRacesReallocateRegression) {
+    Env env(2);
+    MetricsWriter w(env.file, env.stack);
+    const AllocResult done = w.allocate(30, MetricKind::Gauge, -1, {}, "done");  // slot 0, written by main only
+    (void)w.allocate(1, MetricKind::Gauge, -1, {}, "A");                          // slot 1 is the one reused
+    (void)w.free(1);
+    constexpr int kCycles = 100'000;
+    constexpr int64_t kMaxScans = 50'000'000;  // hard cap: fails instead of hanging
+    int64_t mismatches = 0, seen = 0, scans = 0;
+    bool sawDone = false;
+    std::thread reader([&] {
+        MetricsReader r(env.file);
+        while (scans < kMaxScans && !sawDone) {
+            ++scans;
+            r.forEachLive([&](const Live& l) {
+                if (l.typeId == 30) { sawDone = l.value == 1; return; }
+                if (l.value == 0) return;
+                ++seen;
+                const char want = l.value == 1 ? 'A' : 'B';
+                if (l.label().empty() || l.label()[0] != want || l.label().back() != want) ++mismatches;
+            });
+        }
+    });
+    for (int c = 0; c < kCycles; ++c) {
+        const bool a = (c & 1) == 0;
+        auto res = w.allocate(1, MetricKind::Gauge, -1, {},
+                              a ? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                                : "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+        res.writer.set(a ? 1 : 2);
+        (void)w.free(1);
+    }
+    done.writer.set(1);
+    reader.join();
+    EXPECT_TRUE(sawDone) << "reader never saw the done slot in " << scans << " scans";
+    EXPECT_GT(seen, 0);
+    EXPECT_EQ(mismatches, 0) << "label of one owner paired with the value of another, seen " << seen;
+}
+
+TEST(MetricsReaderRegression, LabelCopiedBeforeCheckRegression) {
+    for (ReadStep when : {ReadStep::AfterFirstRegId, ReadStep::AfterValue}) {
+        Env env(2);
+        MetricsWriter w(env.file, env.stack);
+        auto a = w.allocate(1, MetricKind::Counter, -1, bytes(4, 7), "old-label");
+        a.writer.set(5);
+        ReuseState st{&w, when, false};  // frees the slot and allocates "new" with value 777
+        BasicMetricsReader<ReuseHook> r(env.file, ReuseHook{&st});
+        const SlotView v = r.read(0);
+        ASSERT_TRUE(st.fired);
+        // The label, key and value were copied before the owner changed: never a Live of mixed owners.
+        EXPECT_FALSE(std::holds_alternative<Live>(v)) << "step " << static_cast<int>(when);
+        const SlotView again = r.read(0);
+        ASSERT_TRUE(std::holds_alternative<Live>(again));
+        EXPECT_EQ(std::get<Live>(again).label(), "new");
+        EXPECT_EQ(std::get<Live>(again).key().size(), 0U);
+        EXPECT_EQ(std::get<Live>(again).value, 777);
+    }
+}
+
+TEST(MetricsReaderRegression, LiveIsACopyRegression) {
+    Env env(1);
+    MetricsWriter w(env.file, env.stack);
+    auto a = w.allocate(1, MetricKind::Counter, -1, bytes(3, 9), "first");
+    MetricsReader r(env.file);
+    const Live copy = std::get<Live>(r.read(0));
+    ASSERT_EQ(w.free(0), FreeStatus::Ok);
+    (void)w.allocate(2, MetricKind::Gauge, -1, bytes(5, 1), "second-owner-label");
+    // The copy still describes the first owner.
+    EXPECT_EQ(copy.label(), "first");
+    EXPECT_EQ(copy.key().size(), 3U);
+    EXPECT_EQ(copy.key()[0], std::byte{9});
+    EXPECT_EQ(copy.typeId, 1);
+    // No view escapes into the mapping.
+    const auto* base = reinterpret_cast<const char*>(env.file.base());
+    EXPECT_FALSE(copy.label().data() >= base && copy.label().data() < base + env.file.length());
+    EXPECT_FALSE(reinterpret_cast<const char*>(copy.key().data()) >= base &&
+                 reinterpret_cast<const char*>(copy.key().data()) < base + env.file.length());
+    (void)a;
 }

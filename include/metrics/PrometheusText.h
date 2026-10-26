@@ -67,7 +67,7 @@ private:
         s.put("\",slot=\"");
         s.putNumber(l.slot);
         s.put("\",label=\"");
-        s.putEscaped(l.label);
+        s.putEscaped(l.label());
         s.put("\"} ");
     }
 

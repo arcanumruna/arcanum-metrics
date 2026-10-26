@@ -6,6 +6,7 @@
 #include "metrics/MetricsLayout.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +20,9 @@
 namespace metrics {
 
 struct Empty {};
+// One owner's view of a slot, copied out of the mapping: nothing here points into the file, so it stays valid and
+// consistent whatever the writer does next. key() and label() view the copy inside this object (do not use them
+// after the Live is destroyed).
 struct Live {
     int32_t slot;
     int32_t typeId;
@@ -26,9 +30,17 @@ struct Live {
     int64_t regId;
     int64_t ownerTag;
     int64_t value;
-    // Point into the mapping. Valid while the slot is not reused; re-read the slot to find out.
-    std::span<const std::byte> key;
-    std::string_view label;
+    int32_t keyLength;
+    int32_t labelLength;
+    std::array<std::byte, kMaxKeyLength> keyBytes;
+    std::array<char, kMaxLabelLength> labelBytes;
+
+    [[nodiscard]] std::span<const std::byte> key() const noexcept {
+        return std::span<const std::byte>(keyBytes.data(), static_cast<size_t>(keyLength));
+    }
+    [[nodiscard]] std::string_view label() const noexcept {
+        return std::string_view(labelBytes.data(), static_cast<size_t>(labelLength));
+    }
 };
 struct Reused {
     int32_t slot;
@@ -58,28 +70,32 @@ public:
         }
         const int64_t regId = ref64(m, kMetaRegIdOffset).load(std::memory_order_acquire);
         hook_(ReadStep::AfterFirstRegId, slot);
-        const int32_t typeId = ref32(m, kMetaTypeIdOffset).load(std::memory_order_relaxed);
-        const int32_t kind = ref32(m, kMetaKindOffset).load(std::memory_order_relaxed);
-        const int64_t ownerTag = ref64(m, kMetaOwnerTagOffset).load(std::memory_order_relaxed);
-        const int32_t keyLen = ref32(m, kMetaKeyLengthOffset).load(std::memory_order_relaxed);
-        const int32_t labelLen = ref32(m, kMetaLabelLengthOffset).load(std::memory_order_relaxed);
-        const int64_t value = std::atomic_ref<int64_t>(*valuePtr(slot)).load(std::memory_order_acquire);
+
+        // Copy everything out with relaxed loads, then validate the copy with the checks below.
+        SlotView view;
+        Live& l = view.template emplace<Live>();
+        l.slot = slot;
+        l.regId = regId;
+        l.typeId = ref32(m, kMetaTypeIdOffset).load(std::memory_order_relaxed);
+        l.kind = static_cast<MetricKind>(ref32(m, kMetaKindOffset).load(std::memory_order_relaxed));
+        l.ownerTag = ref64(m, kMetaOwnerTagOffset).load(std::memory_order_relaxed);
+        l.keyLength = static_cast<int32_t>(clamp(ref32(m, kMetaKeyLengthOffset).load(std::memory_order_relaxed), kMaxKeyLength));
+        l.labelLength = static_cast<int32_t>(clamp(ref32(m, kMetaLabelLengthOffset).load(std::memory_order_relaxed), kMaxLabelLength));
+        loadWords(m + kMetaKeyOffset, l.keyBytes.data(), static_cast<size_t>(l.keyLength));
+        loadWords(m + kMetaLabelOffset, l.labelBytes.data(), static_cast<size_t>(l.labelLength));
+        l.value = std::atomic_ref<int64_t>(*valuePtr(slot)).load(std::memory_order_acquire);
         hook_(ReadStep::AfterValue, slot);
-        // State before regId: a value of 0 seen after a free proves the free is visible here, and a state of
-        // Allocated then proves the new regId is visible too. (regId first would allow Live{oldRegId, 0}.)
+
+        // Seqlock validation. The fence pairs with the allocator's release fence: if any byte copied above came
+        // from a later owner, the state and regId read now show that owner. State before regId: a value of 0
+        // seen after a free proves the free is visible here, and a state of Allocated then proves the new regId
+        // is visible too. (regId first would allow Live{oldRegId, 0}.)
+        std::atomic_thread_fence(std::memory_order_acquire);
         if (ref32(m, kMetaStateOffset).load(std::memory_order_acquire) != static_cast<int32_t>(SlotState::Allocated)) {
             return Empty{};  // freed while reading
         }
-        const int64_t regIdAgain = ref64(m, kMetaRegIdOffset).load(std::memory_order_acquire);
-        if (regIdAgain != regId) return Reused{slot, regId};
-        return Live{slot,
-                    typeId,
-                    static_cast<MetricKind>(kind),
-                    regId,
-                    ownerTag,
-                    value,
-                    std::span<const std::byte>(m + kMetaKeyOffset, clamp(keyLen, kMaxKeyLength)),
-                    std::string_view(reinterpret_cast<const char*>(m + kMetaLabelOffset), clamp(labelLen, kMaxLabelLength))};
+        if (ref64(m, kMetaRegIdOffset).load(std::memory_order_acquire) != regId) return Reused{slot, regId};
+        return view;
     }
 
     // Calls f(const Live&) for every live slot. A slot found Reused is read once more. Slots are handed out in
@@ -105,8 +121,8 @@ public:
             }
             const SlotView v = read(s);
             if (const Live* l = std::get_if<Live>(&v)) {
-                if (l->typeId == typeId && l->key.size() == key.size() &&
-                    (key.empty() || std::memcmp(l->key.data(), key.data(), key.size()) == 0)) {
+                if (l->typeId == typeId && l->key().size() == key.size() &&
+                    (key.empty() || std::memcmp(l->key().data(), key.data(), key.size()) == 0)) {
                     found = s;
                 }
             }
@@ -116,6 +132,14 @@ public:
 
 private:
     static size_t clamp(int32_t n, int32_t max) noexcept { return static_cast<size_t>(std::clamp(n, 0, max)); }
+    // Copies `n` bytes starting at a 4-aligned region with relaxed 32-bit word loads.
+    static void loadWords(const std::byte* region, void* dst, size_t n) noexcept {
+        for (size_t off = 0; off < n; off += 4) {
+            const uint32_t w = std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(const_cast<std::byte*>(region) + off))
+                                   .load(std::memory_order_relaxed);
+            std::memcpy(static_cast<std::byte*>(dst) + off, &w, std::min<size_t>(4, n - off));
+        }
+    }
     const std::byte* meta(int32_t slot) const noexcept {
         return base_ + layout_.metadataOffset() + int64_t{slot} * kMetadataRecordLength;
     }

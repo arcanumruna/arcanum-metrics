@@ -15,6 +15,9 @@
 
 namespace metrics {
 
+static_assert(kMaxKeyLength % 4 == 0 && kMaxLabelLength % 4 == 0 && kMetaKeyOffset % 4 == 0 &&
+              kMetaLabelOffset % 4 == 0, "key and label are written and read as 32-bit words");
+
 enum class AllocStatus : int32_t { Ok, Full, KeyTooLong, LabelTooLong, InvalidType, InvalidOwnerTag };
 enum class FreeStatus : int32_t { Ok, NotAllocated, OutOfRange };
 
@@ -98,10 +101,14 @@ public:
         const int64_t id = nextRegId_++;
         std::byte* m = meta(slot);
 
-        std::memcpy(m + kMetaKeyOffset, key.data(), key.size());
-        std::memset(m + kMetaKeyOffset + key.size(), 0, kMaxKeyLength - key.size());
-        std::memcpy(m + kMetaLabelOffset, label.data(), label.size());
-        std::memset(m + kMetaLabelOffset + label.size(), 0, kMaxLabelLength - label.size());
+        // Order the earlier Freed store before every store below: a reader that sees any of the new owner's
+        // bytes must then also see the slot is no longer the old owner's (its acquire fence pairs with this).
+        std::atomic_thread_fence(std::memory_order_release);
+
+        // Key and label are written as relaxed 32-bit words so a reader copying them concurrently is race-free;
+        // the zero fill is part of the same stores.
+        storeWords(m + kMetaKeyOffset, kMaxKeyLength, key.data(), key.size());
+        storeWords(m + kMetaLabelOffset, kMaxLabelLength, label.data(), label.size());
         putPlain(m, kMetaKeyLengthOffset, static_cast<int32_t>(key.size()));
         putPlain(m, kMetaLabelLengthOffset, static_cast<int32_t>(label.size()));
         putPlain(m, kMetaTypeIdOffset, typeId);
@@ -144,6 +151,14 @@ private:
     }
     int64_t* value(int32_t slot) const noexcept {
         return reinterpret_cast<int64_t*>(base_ + layout_.valuesOffset() + int64_t{slot} * kValueRecordLength);
+    }
+    static void storeWords(std::byte* region, int32_t regionLength, const void* src, size_t n) noexcept {
+        for (int32_t off = 0; off < regionLength; off += 4) {
+            uint32_t w = 0;
+            const size_t have = n > static_cast<size_t>(off) ? std::min<size_t>(4, n - static_cast<size_t>(off)) : 0;
+            if (have != 0) std::memcpy(&w, static_cast<const std::byte*>(src) + off, have);
+            std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(region + off)).store(w, std::memory_order_relaxed);
+        }
     }
     // Scalar metadata is stored relaxed through atomic_ref: a reader may scan a slot while it is reused.
     // The release store of the regId and the state publishes it.
