@@ -24,6 +24,7 @@ struct Live {
     int32_t typeId;
     MetricKind kind;
     int64_t regId;
+    int64_t ownerTag;
     int64_t value;
     // Point into the mapping. Valid while the slot is not reused; re-read the slot to find out.
     std::span<const std::byte> key;
@@ -59,6 +60,7 @@ public:
         hook_(ReadStep::AfterFirstRegId, slot);
         const int32_t typeId = ref32(m, kMetaTypeIdOffset).load(std::memory_order_relaxed);
         const int32_t kind = ref32(m, kMetaKindOffset).load(std::memory_order_relaxed);
+        const int64_t ownerTag = ref64(m, kMetaOwnerTagOffset).load(std::memory_order_relaxed);
         const int32_t keyLen = ref32(m, kMetaKeyLengthOffset).load(std::memory_order_relaxed);
         const int32_t labelLen = ref32(m, kMetaLabelLengthOffset).load(std::memory_order_relaxed);
         const int64_t value = std::atomic_ref<int64_t>(*valuePtr(slot)).load(std::memory_order_acquire);
@@ -74,6 +76,7 @@ public:
                     typeId,
                     static_cast<MetricKind>(kind),
                     regId,
+                    ownerTag,
                     value,
                     std::span<const std::byte>(m + kMetaKeyOffset, clamp(keyLen, kMaxKeyLength)),
                     std::string_view(reinterpret_cast<const char*>(m + kMetaLabelOffset), clamp(labelLen, kMaxLabelLength))};
@@ -175,6 +178,8 @@ public:
                         entries_[s] = first;  // reused slot: restart, never a delta across owners
                     } else if (nowNs <= prev.ns) {
                         entries_[s] = first;  // no elapsed time, no rate
+                    } else if (isBackwards(l->value, prev.value)) {
+                        entries_[s] = first;  // a total that went backwards: rebaseline, never a negative rate
                     } else {
                         // Unsigned subtraction: a total crossing INT64_MAX is still one positive delta.
                         const int64_t delta = static_cast<int64_t>(static_cast<uint64_t>(l->value) -
@@ -185,6 +190,11 @@ public:
                 },
                 entries_[s]);
         }
+    }
+
+    // Wrap-aware: a forward step across INT64_MAX is a small positive delta; a step of more than 2^63 back is not.
+    static bool isBackwards(int64_t now, int64_t before) noexcept {
+        return static_cast<int64_t>(static_cast<uint64_t>(now) - static_cast<uint64_t>(before)) < 0;
     }
 
     [[nodiscard]] std::optional<double> perSecond(int32_t slot) const noexcept {

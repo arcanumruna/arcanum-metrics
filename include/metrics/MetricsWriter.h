@@ -15,7 +15,7 @@
 
 namespace metrics {
 
-enum class AllocStatus : int32_t { Ok, Full, KeyTooLong, LabelTooLong, InvalidType, InvalidRegId };
+enum class AllocStatus : int32_t { Ok, Full, KeyTooLong, LabelTooLong, InvalidType, InvalidOwnerTag };
 enum class FreeStatus : int32_t { Ok, NotAllocated, OutOfRange };
 
 class SlotWriter {  // trivially copyable value type; exactly one writer thread per slot
@@ -75,11 +75,11 @@ public:
           freeStack_(freeStackStorage.data()),
           hook_(hook) {}
 
-    [[nodiscard]] AllocResult allocate(int32_t typeId, MetricKind kind, int64_t regId /* -1 = next */,
+    [[nodiscard]] AllocResult allocate(int32_t typeId, MetricKind kind, int64_t ownerTag /* -1 = none, stored as 0 */,
                                        std::span<const std::byte> key, std::string_view label) noexcept {
         // Argument checks first, in this order; none of them touches the file.
         if (typeId < 0 || (kind != MetricKind::Counter && kind != MetricKind::Gauge)) return fail(AllocStatus::InvalidType);
-        if (regId < -1) return fail(AllocStatus::InvalidRegId);
+        if (ownerTag < -1) return fail(AllocStatus::InvalidOwnerTag);
         if (key.size() > static_cast<size_t>(kMaxKeyLength)) return fail(AllocStatus::KeyTooLong);
         if (label.size() > static_cast<size_t>(kMaxLabelLength)) return fail(AllocStatus::LabelTooLong);
 
@@ -93,7 +93,9 @@ public:
         }
         if (freeCount_ > 0) --freeCount_; else ++nextUnused_;
 
-        const int64_t id = regId == -1 ? nextRegId_++ : regId;
+        // The regId is always the allocator's own counter: unique for the writer's whole life, never reused. The
+        // caller's number is only a tag (Phase 2: the namespace id) and may repeat across live slots.
+        const int64_t id = nextRegId_++;
         std::byte* m = meta(slot);
 
         std::memcpy(m + kMetaKeyOffset, key.data(), key.size());
@@ -104,7 +106,7 @@ public:
         putPlain(m, kMetaLabelLengthOffset, static_cast<int32_t>(label.size()));
         putPlain(m, kMetaTypeIdOffset, typeId);
         putPlain(m, kMetaKindOffset, static_cast<int32_t>(kind));
-        putPlain(m, kMetaOwnerTagOffset, int64_t{0});
+        putPlain(m, kMetaOwnerTagOffset, ownerTag < 0 ? int64_t{0} : ownerTag);
         hook_(AllocStep::Metadata, slot);
 
         int64_t* v = value(slot);

@@ -45,7 +45,7 @@ struct ErrRow {
     int32_t maxSlots;
     int32_t prefill;
     int32_t typeId;
-    int64_t regId;
+    int64_t ownerTag;
     size_t keyLen;
     size_t labelLen;
     AllocStatus expect;
@@ -61,14 +61,14 @@ std::vector<ErrRow> errRows() {
     rows.push_back({3, 3, 7, -1, 4, 4, AllocStatus::Full});
     // single-fault matrix over type x regId x key x label on a file with room
     for (int32_t t : {0, -1, INT32_MAX, 1000}) {
-        for (int64_t r : {int64_t{-1}, int64_t{0}, int64_t{5}, int64_t{-2}, INT64_MAX}) {
+        for (int64_t r : {int64_t{-1}, int64_t{0}, int64_t{5}, int64_t{-2}, INT64_MAX, INT64_MIN}) {
             for (size_t k : {size_t{0}, size_t{1}, size_t{112}, size_t{113}}) {
                 for (size_t l : {size_t{0}, size_t{1}, size_t{363}, size_t{364}, size_t{365}}) {
                     const int faults = (t < 0) + (r < -1) + (k > 112) + (l > 364);
                     if (faults > 1) continue;
                     AllocStatus e = AllocStatus::Ok;
                     if (t < 0) e = AllocStatus::InvalidType;
-                    else if (r < -1) e = AllocStatus::InvalidRegId;
+                    else if (r < -1) e = AllocStatus::InvalidOwnerTag;
                     else if (k > 112) e = AllocStatus::KeyTooLong;
                     else if (l > 364) e = AllocStatus::LabelTooLong;
                     rows.push_back({4, 0, t, r, k, l, e});
@@ -95,7 +95,7 @@ TEST_P(MetricsWriterRegressionErrorTable, Row) {
     AllocResult res;
     {
         metrics::testing::AllocScope scope;
-        res = w.allocate(r.typeId, MetricKind::Gauge, r.regId, key, label);
+        res = w.allocate(r.typeId, MetricKind::Gauge, r.ownerTag, key, label);
         EXPECT_EQ(scope.count(), 0);
     }
     EXPECT_EQ(res.status, r.expect);
@@ -109,7 +109,8 @@ TEST_P(MetricsWriterRegressionErrorTable, Row) {
         EXPECT_EQ(env.metaAt<int32_t>(res.writer.slot(), kMetaLabelLengthOffset), static_cast<int32_t>(r.labelLen));
         EXPECT_EQ(std::memcmp(env.meta(res.writer.slot()) + kMetaLabelOffset, label.data(), r.labelLen), 0);
         EXPECT_EQ(std::memcmp(env.meta(res.writer.slot()) + kMetaKeyOffset, key.data(), r.keyLen), 0);
-        if (r.regId >= 0) EXPECT_EQ(res.regId, r.regId);
+        EXPECT_GT(res.regId, 0);
+        EXPECT_EQ(env.metaAt<int64_t>(res.writer.slot(), kMetaOwnerTagOffset), r.ownerTag < 0 ? 0 : r.ownerTag);
         EXPECT_EQ(env.metaAt<int64_t>(res.writer.slot(), kMetaRegIdOffset), res.regId);
     } else {
         EXPECT_EQ(w.allocatedCount(), countBefore);
@@ -230,10 +231,11 @@ TEST(MetricsWriterRegression, AutoRegIdMonotonicRegression) {
         last = r.regId;
         if (i % 2 == 1) ASSERT_EQ(w.free(r.writer.slot()), FreeStatus::Ok);
         else if (i % 4 == 0) ASSERT_EQ(w.free(r.writer.slot()), FreeStatus::Ok);
-        // explicit regIds do not disturb the auto sequence
+        // an explicit owner tag never becomes a regId, so it cannot collide with the sequence
         auto e = w.allocate(1, MetricKind::Counter, 3, {}, "e");
         ASSERT_EQ(e.status, AllocStatus::Ok);
-        EXPECT_EQ(e.regId, 3);
+        EXPECT_GT(e.regId, last);
+        last = e.regId;
         ASSERT_EQ(w.free(e.writer.slot()), FreeStatus::Ok);
         if (w.allocatedCount() >= 2) {
             // keep room: free everything still held

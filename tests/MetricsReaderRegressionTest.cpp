@@ -53,7 +53,7 @@ TEST(MetricsReaderRegression, ReadStatesTable) {
     Env env(4);
     MetricsWriter w(env.file, env.stack);
     const auto key = bytes(4, 0x11);
-    auto a = w.allocate(42, MetricKind::Gauge, 9, key, "lab");
+    auto a = w.allocate(42, MetricKind::Gauge, 9, key, "lab");  // 9 is the owner tag
     a.writer.set(-5);
     auto b = w.allocate(43, MetricKind::Counter, -1, {}, "");
     ASSERT_EQ(w.free(b.writer.slot()), FreeStatus::Ok);
@@ -65,7 +65,8 @@ TEST(MetricsReaderRegression, ReadStatesTable) {
     EXPECT_EQ(l.slot, 0);
     EXPECT_EQ(l.typeId, 42);
     EXPECT_EQ(l.kind, MetricKind::Gauge);
-    EXPECT_EQ(l.regId, 9);
+    EXPECT_EQ(l.regId, a.regId);
+    EXPECT_EQ(l.ownerTag, 9);
     EXPECT_EQ(l.value, -5);
     ASSERT_EQ(l.key.size(), 4U);
     EXPECT_EQ(l.key[0], std::byte{0x11});
@@ -315,4 +316,111 @@ TEST(MetricsReaderRegression, StaleRegIdWithZeroedValueRegression) {
             EXPECT_EQ(std::get<Reused>(v).oldRegId, a.regId);
         }
     }
+}
+
+// ---- regId is unique per allocation; a caller's id is only an owner tag -----------------------------------
+TEST(MetricsReaderRegression, AutoExplicitRegIdCollisionRegression) {
+    Env env(4);
+    MetricsWriter w(env.file, env.stack);
+    auto a = w.allocate(1, MetricKind::Counter, -1, {}, "auto");  // first regId
+    auto b = w.allocate(1, MetricKind::Counter, a.regId, {}, "explicit");  // asks for the same number as a tag
+    auto c = w.allocate(1, MetricKind::Counter, 1, {}, "explicit1");
+    EXPECT_NE(a.regId, b.regId);
+    EXPECT_NE(a.regId, c.regId);
+    EXPECT_NE(b.regId, c.regId);
+    MetricsReader r(env.file);
+    EXPECT_EQ(std::get<Live>(r.read(1)).ownerTag, a.regId);
+    EXPECT_EQ(std::get<Live>(r.read(1)).regId, b.regId);
+    EXPECT_EQ(std::get<Live>(r.read(2)).ownerTag, 1);
+    EXPECT_EQ(std::get<Live>(r.read(0)).ownerTag, 0);  // -1: no tag
+}
+
+TEST(MetricsReaderRegression, SameRegIdReuseRegression) {
+    Env env(1);
+    MetricsWriter w(env.file, env.stack);
+    auto a = w.allocate(1, MetricKind::Counter, 5, {}, "old");
+    MetricsReader r(env.file);
+    auto rt = std::make_unique<RateTracker<1, 4>>();
+    constexpr int64_t S = 1'000'000'000;
+    a.writer.set(1000);
+    rt->sample(r, 0);
+    a.writer.set(2000);
+    rt->sample(r, S);
+    ASSERT_EQ(w.free(0), FreeStatus::Ok);
+    auto b = w.allocate(1, MetricKind::Counter, 5, {}, "new");  // the same owner tag again
+    ASSERT_EQ(b.status, AllocStatus::Ok);
+    EXPECT_NE(a.regId, b.regId);
+    b.writer.set(10);
+    rt->sample(r, 2 * S);
+    EXPECT_FALSE(rt->perSecond(0).has_value()) << "a rate across two owners";
+    b.writer.set(510);
+    rt->sample(r, 3 * S);
+    ASSERT_TRUE(rt->perSecond(0).has_value());
+    EXPECT_DOUBLE_EQ(*rt->perSecond(0), 500.0);
+}
+
+TEST(RateTrackerRegression, NegativeDeltaRestartsRegression) {
+    Env env(1);
+    MetricsWriter w(env.file, env.stack);
+    auto a = w.allocate(1, MetricKind::Counter, -1, {}, "a");
+    MetricsReader r(env.file);
+    auto rt = std::make_unique<RateTracker<1, 4>>();
+    constexpr int64_t S = 1'000'000'000;
+    a.writer.set(2000);
+    rt->sample(r, 0);
+    a.writer.set(2500);
+    rt->sample(r, S);
+    ASSERT_TRUE(rt->perSecond(0).has_value());
+    a.writer.set(10);  // a total that went backwards under the same regId: rebaseline, no negative rate
+    rt->sample(r, 2 * S);
+    EXPECT_FALSE(rt->perSecond(0).has_value());
+    a.writer.set(110);
+    rt->sample(r, 3 * S);
+    ASSERT_TRUE(rt->perSecond(0).has_value());
+    EXPECT_DOUBLE_EQ(*rt->perSecond(0), 100.0);
+}
+
+namespace {
+struct SameTagState { MetricsWriter* w; bool fired = false; };
+struct SameTagHook {
+    SameTagState* st;
+    void operator()(ReadStep step, int32_t slot) const noexcept {
+        if (st->fired || step != ReadStep::AfterValue) return;
+        st->fired = true;
+        (void)st->w->free(slot);
+        (void)st->w->allocate(99, MetricKind::Gauge, 5, {}, "NEW");
+    }
+};
+}  // namespace
+
+TEST(MetricsReaderRegression, SameRegIdReuseMixesOwnersRegression) {
+    Env env(1);
+    MetricsWriter w(env.file, env.stack);
+    auto a = w.allocate(1, MetricKind::Counter, 5, {}, "old");
+    a.writer.set(4242);
+    SameTagState st{&w};
+    BasicMetricsReader<SameTagHook> r(env.file, SameTagHook{&st});
+    const SlotView v = r.read(0);
+    ASSERT_TRUE(st.fired);
+    ASSERT_TRUE(std::holds_alternative<Reused>(v)) << "a Live must describe one owner";
+    EXPECT_EQ(std::get<Reused>(v).oldRegId, a.regId);
+}
+
+TEST(WindowSamplerRegression, ReuseUnderSameOwnerTagRestartsRegression) {
+    Env env(1);
+    MetricsWriter w(env.file, env.stack);
+    auto a = w.allocate(1, MetricKind::Gauge, 5, {}, "old");
+    MetricsReader r(env.file);
+    auto ws = std::make_unique<WindowSampler<1, 4>>();
+    a.writer.set(100);
+    ws->sample(r, 0);
+    a.writer.set(200);
+    ws->sample(r, 1);
+    EXPECT_EQ(*ws->max(0), 200);
+    ASSERT_EQ(w.free(0), FreeStatus::Ok);
+    auto b = w.allocate(1, MetricKind::Gauge, 5, {}, "new");
+    b.writer.set(1);
+    ws->sample(r, 2);
+    EXPECT_EQ(*ws->max(0), 1);  // not 200: the window restarted for the new owner
+    EXPECT_DOUBLE_EQ(*ws->avg(0), 1.0);
 }

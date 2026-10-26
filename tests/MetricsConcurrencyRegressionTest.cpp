@@ -3,7 +3,7 @@
 // Threads (the library starts none; the test owns them):
 //  - 4 writer threads, each owns 8 slots and adds 1 to each, kWriterIterations times;
 //  - the allocator thread (owner of MetricsWriter) frees and reallocates one block of 8 slots kBlockCycles times,
-//    each cycle under a new regId, writing regId * 1e9 + k into the block's slots;
+//    each cycle under a new owner tag, writing tag * 1e9 + k into the block's slots;
 //  - a reader thread scans continuously until the "done" slot, written by the main thread, reads 1.
 // The reader never reads key or label bytes: those are plain bytes by design and are only valid until reuse.
 #include "TestDir.h"
@@ -40,7 +40,7 @@ constexpr int64_t kMaxScans = 400'000'000;  // hard cap: a stuck run fails inste
 struct ReaderResult {
     int64_t scans = 0;
     int64_t violations = 0;
-    int64_t blockRegIdsSeen = 0;
+    int64_t blockTagsSeen = 0;
     int64_t reusedSeen = 0;
     bool timedOut = false;
 };
@@ -49,7 +49,7 @@ void readerLoop(const MetricsFile& file, ReaderResult& out) {
     MetricsReader reader(file);
     struct Last { int64_t regId = -1; int64_t value = 0; };
     std::array<Last, kTotalSlots> last{};
-    int64_t lastBlockRegId = -1;
+    int64_t lastBlockTag = -1;
     for (int64_t scan = 0; scan < kMaxScans; ++scan) {
         ++out.scans;
         bool done = false;
@@ -65,12 +65,12 @@ void readerLoop(const MetricsFile& file, ReaderResult& out) {
             if (s < kBlockFirstSlot) {
                 if (l->value < 0 || l->value > kWriterIterations) ++out.violations;
             } else if (s < kDoneSlot) {
-                // the block writes regId * 1e9 + k; 0 is the zeroed value before its first update
-                if (l->value != 0 && (l->value / kRegIdScale != l->regId ||
+                // the block writes ownerTag * 1e9 + k; 0 is the zeroed value before its first update
+                if (l->value != 0 && (l->value / kRegIdScale != l->ownerTag ||
                                       l->value % kRegIdScale > kUpdatesPerCycle)) {
                     ++out.violations;
                 }
-                if (l->regId != lastBlockRegId) { ++out.blockRegIdsSeen; lastBlockRegId = l->regId; }
+                if (l->ownerTag != lastBlockTag) { ++out.blockTagsSeen; lastBlockTag = l->ownerTag; }
             } else if (l->value == 1) {
                 done = true;
             }
@@ -103,7 +103,7 @@ TEST(MetricsConcurrencyRegression, WriterReaderAllocatorUnderTsanRegression) {
     }
     std::array<SlotWriter, kBlockSlots> block0;
     for (int i = 0; i < kBlockSlots; ++i) {
-        const AllocResult r = alloc.allocate(20, MetricKind::Gauge, kFirstBlockRegId - 1, {}, "b");
+        const AllocResult r = alloc.allocate(20, MetricKind::Gauge, kFirstBlockRegId - 1, {}, "b");  // owner tag
         ASSERT_EQ(r.status, AllocStatus::Ok);
         block0[static_cast<size_t>(i)] = r.writer;
     }
@@ -128,15 +128,15 @@ TEST(MetricsConcurrencyRegression, WriterReaderAllocatorUnderTsanRegression) {
     }
     std::thread allocator([&] {
         for (int cycle = 0; cycle < kBlockCycles; ++cycle) {
-            const int64_t regId = kFirstBlockRegId + cycle;
+            const int64_t tag = kFirstBlockRegId + cycle;  // shared by the block; each slot still gets its own regId
             std::array<SlotWriter, kBlockSlots> b;
             for (int i = 0; i < kBlockSlots; ++i) {
-                const AllocResult r = alloc.allocate(20, MetricKind::Gauge, regId, {}, "b");
+                const AllocResult r = alloc.allocate(20, MetricKind::Gauge, tag, {}, "b");
                 if (r.status != AllocStatus::Ok) { ADD_FAILURE() << "block allocate failed"; return; }
                 b[static_cast<size_t>(i)] = r.writer;
             }
             for (int k = 1; k <= kUpdatesPerCycle; ++k) {
-                for (const SlotWriter& s : b) s.set(regId * kRegIdScale + k);
+                for (const SlotWriter& s : b) s.set(tag * kRegIdScale + k);
             }
             for (const SlotWriter& s : b) {
                 if (alloc.free(s.slot()) != FreeStatus::Ok) { ADD_FAILURE() << "block free failed"; return; }
@@ -152,7 +152,7 @@ TEST(MetricsConcurrencyRegression, WriterReaderAllocatorUnderTsanRegression) {
     EXPECT_FALSE(result.timedOut);
     EXPECT_EQ(result.violations, 0);
     EXPECT_GT(result.scans, 0);
-    EXPECT_GT(result.blockRegIdsSeen, 0) << "the reader never overlapped the allocator: vacuous run";
+    EXPECT_GT(result.blockTagsSeen, 0) << "the reader never overlapped the allocator: vacuous run";
     MetricsReader check(file);
     for (int s = 0; s < kBlockFirstSlot; ++s) {
         const SlotView v = check.read(s);
