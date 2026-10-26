@@ -48,6 +48,11 @@ struct Reused {
 };
 using SlotView = std::variant<Empty, Live, Reused>;
 
+struct SlotRef {
+    int32_t slot;   // -1: none
+    int64_t regId;  // -1: none
+};
+
 // Steps of a slot read, for deterministic tests. The default hook is empty.
 enum class ReadStep : int32_t { AfterFirstRegId, AfterValue };
 struct NoReadHook {
@@ -112,10 +117,10 @@ public:
         }
     }
 
-    // First live slot with this typeId and key, or -1.
-    [[nodiscard]] int32_t findFirst(int32_t typeId, std::span<const std::byte> key) const noexcept {
-        int32_t found = -1;
-        for (int32_t s = 0; s < layout_.maxSlots && found < 0; ++s) {
+    // First live slot with this typeId and key, with the regId it had when matched ({-1, -1} if none).
+    [[nodiscard]] SlotRef findFirst(int32_t typeId, std::span<const std::byte> key) const noexcept {
+        SlotRef found{-1, -1};
+        for (int32_t s = 0; s < layout_.maxSlots && found.slot < 0; ++s) {
             if (ref32(meta(s), kMetaStateOffset).load(std::memory_order_acquire) == static_cast<int32_t>(SlotState::Unused)) {
                 break;
             }
@@ -123,7 +128,7 @@ public:
             if (const Live* l = std::get_if<Live>(&v)) {
                 if (l->typeId == typeId && l->key().size() == key.size() &&
                     (key.empty() || std::memcmp(l->key().data(), key.data(), key.size()) == 0)) {
-                    found = s;
+                    found = SlotRef{s, l->regId};
                 }
             }
         }
@@ -160,6 +165,8 @@ private:
 
 using MetricsReader = BasicMetricsReader<NoReadHook>;
 
+enum class TrackerStatus : int32_t { Ok, CapacityTooSmall };
+
 // Per-slot rate state: one explicit state each, restarted when the regId changes.
 namespace detail {
 struct RateAbsent {};
@@ -182,9 +189,19 @@ class RateTracker {
     static_assert(Capacity > 0 && Window > 0);
 
 public:
+    // Binds the tracker to a reader's file. A Capacity below the file's slot count is refused (the tracker stays
+    // unbound and samples nothing) rather than silently covering only the first Capacity slots.
+    template <class Reader>
+    [[nodiscard]] TrackerStatus bind(const Reader& reader) noexcept {
+        bound_ = 0;
+        if (reader.maxSlots() > Capacity) return TrackerStatus::CapacityTooSmall;
+        bound_ = reader.maxSlots();
+        return TrackerStatus::Ok;
+    }
+
     template <class Reader>
     void sample(const Reader& reader, int64_t nowNs) noexcept {
-        const int32_t n = std::min(Capacity, reader.maxSlots());
+        const int32_t n = std::min(bound_, reader.maxSlots());
         for (int32_t s = 0; s < n; ++s) {
             const SlotView v = reader.read(s);
             const Live* l = std::get_if<Live>(&v);
@@ -237,6 +254,7 @@ public:
     }
 
 private:
+    int32_t bound_ = 0;
     std::variant<detail::RateAbsent, detail::RateFirst, detail::RateRated> entries_[Capacity]{};
 };
 
@@ -248,8 +266,16 @@ class WindowSampler {
 
 public:
     template <class Reader>
+    [[nodiscard]] TrackerStatus bind(const Reader& reader) noexcept {
+        bound_ = 0;
+        if (reader.maxSlots() > Capacity) return TrackerStatus::CapacityTooSmall;
+        bound_ = reader.maxSlots();
+        return TrackerStatus::Ok;
+    }
+
+    template <class Reader>
     void sample(const Reader& reader, [[maybe_unused]] int64_t nowNs) noexcept {
-        const int32_t n = std::min(Capacity, reader.maxSlots());
+        const int32_t n = std::min(bound_, reader.maxSlots());
         for (int32_t s = 0; s < n; ++s) {
             const SlotView v = reader.read(s);
             const Live* l = std::get_if<Live>(&v);
@@ -295,6 +321,7 @@ private:
         if (slot < 0 || slot >= Capacity || entries_[slot].count == 0) return nullptr;
         return &entries_[slot];
     }
+    int32_t bound_ = 0;
     Entry entries_[Capacity]{};
 };
 

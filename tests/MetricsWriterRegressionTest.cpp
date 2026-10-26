@@ -1,5 +1,6 @@
 #include "AllocCounter.h"
 #include "TestDir.h"
+#include "TestHelpers.h"
 
 #include "metrics/MetricsFile.h"
 #include "metrics/MetricsWriter.h"
@@ -84,7 +85,7 @@ class MetricsWriterRegressionErrorTable : public ::testing::TestWithParam<ErrRow
 TEST_P(MetricsWriterRegressionErrorTable, Row) {
     const ErrRow r = GetParam();
     Env env(r.maxSlots);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     for (int32_t i = 0; i < r.prefill; ++i) {
         ASSERT_EQ(w.allocate(1, MetricKind::Counter, -1, {}, "pre").status, AllocStatus::Ok);
     }
@@ -133,7 +134,7 @@ class MetricsWriterRegressionFreeTable : public ::testing::TestWithParam<FreeRow
 TEST_P(MetricsWriterRegressionFreeTable, Row) {
     const FreeRow r = GetParam();
     Env env(4);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     for (int i = 0; i < 2; ++i) ASSERT_EQ(w.allocate(1, MetricKind::Counter, -1, {}, "x").status, AllocStatus::Ok);
     // slots 0 and 1 allocated; 2 and 3 unused
     if (r.freeFirst >= 0) ASSERT_EQ(w.free(r.freeFirst), FreeStatus::Ok);
@@ -166,7 +167,7 @@ INSTANTIATE_TEST_SUITE_P(FreeTable, MetricsWriterRegressionFreeTable,
 // ---- behaviour --------------------------------------------------------------------------------------------
 TEST(MetricsWriterRegression, ReuseLifoAndZeroedRegression) {
     Env env(4);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(10, MetricKind::Counter, -1, bytes(4), "A");
     auto other = w.allocate(11, MetricKind::Counter, -1, {}, "other");
     ASSERT_EQ(a.status, AllocStatus::Ok);
@@ -201,7 +202,7 @@ struct ProbeHook {
         // A reader that sees Allocated must see a zeroed value and the new regId.
         if (st->env->metaAt<int32_t>(slot, kMetaStateOffset) == 1) {
             if (st->env->value(slot) != 0) ++st->violations;
-            if (st->env->metaAt<int64_t>(slot, kMetaRegIdOffset) == 0) ++st->violations;
+            if (st->env->metaAt<int64_t>(slot, kMetaRegIdOffset) != st->newRegId) ++st->violations;
         }
     }
 };
@@ -209,20 +210,22 @@ struct ProbeHook {
 
 TEST(MetricsWriterRegression, ReuseNeverPublishesStaleValueRegression) {
     Env env(2);
-    ProbeState st{&env, 0, 0};
-    BasicMetricsWriter<ProbeHook> w(env.file, env.stack, ProbeHook{&st});
+    ProbeState st{&env, 0, 1};  // the first allocation gets regId 1
+    auto w = metrics::testing::makeWriter<ProbeHook>(env.file, env.stack, ProbeHook{&st});
     auto a = w.allocate(10, MetricKind::Counter, -1, {}, "A");
     a.writer.add(5);
     ASSERT_EQ(w.free(a.writer.slot()), FreeStatus::Ok);
+    st.newRegId = 2;  // the second allocation gets regId 2
     auto b = w.allocate(10, MetricKind::Counter, -1, {}, "B");
     EXPECT_EQ(b.writer.slot(), 0);
+    EXPECT_EQ(b.regId, st.newRegId);
     EXPECT_GE(st.calls, 4);
     EXPECT_EQ(st.violations, 0);
 }
 
 TEST(MetricsWriterRegression, AutoRegIdMonotonicRegression) {
     Env env(3);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     int64_t last = -1;
     for (int i = 0; i < 200; ++i) {
         auto r = w.allocate(1, MetricKind::Counter, -1, {}, "x");
@@ -246,7 +249,7 @@ TEST(MetricsWriterRegression, AutoRegIdMonotonicRegression) {
 
 TEST(MetricsWriterRegression, AddSetSemanticsRegression) {
     Env env(1);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto r = w.allocate(1, MetricKind::Counter, -1, {}, "x");
     r.writer.add(3);
     r.writer.add(4);
@@ -263,7 +266,7 @@ TEST(MetricsWriterRegression, AddSetSemanticsRegression) {
 
 TEST(MetricsWriterRegression, ZeroAllocAllOpsRegression) {
     Env env(8);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     const auto key = bytes(4);
     metrics::testing::AllocScope scope;
     for (int i = 0; i < 100; ++i) {
@@ -274,4 +277,45 @@ TEST(MetricsWriterRegression, ZeroAllocAllOpsRegression) {
         (void)w.free(r.writer.slot());
     }
     EXPECT_EQ(scope.count(), 0);
+}
+
+TEST(MetricsWriterRegression, FreeStackShorterThanMaxSlotsRefusedRegression) {
+    metrics::testing::TestDir dir;
+    const std::string p = dir.path("fs.dat");
+    MetricsFile f;
+    CreateParams cp{p.c_str(), 4, 4, 1, 1, {}};
+    ASSERT_EQ(MetricsFile::create(cp, f), FileStatus::Ok);
+    std::vector<int32_t> stack(4);
+    MetricsWriter w;
+    EXPECT_EQ(MetricsWriter::create(f, std::span<int32_t>(stack.data(), 3), w), WriterStatus::FreeStackTooSmall);
+    // A refused writer allocates nothing.
+    EXPECT_EQ(w.allocate(1, MetricKind::Counter, -1, {}, "x").status, AllocStatus::Full);
+    EXPECT_EQ(MetricsWriter::create(f, std::span<int32_t>(), w), WriterStatus::FreeStackTooSmall);
+    EXPECT_EQ(MetricsWriter::create(f, std::span<int32_t>(stack.data(), 4), w), WriterStatus::Ok);
+    EXPECT_EQ(w.allocate(1, MetricKind::Counter, -1, {}, "x").status, AllocStatus::Ok);
+    // Zero slots need no storage.
+    const std::string p0 = dir.path("fs0.dat");
+    MetricsFile f0;
+    CreateParams cp0{p0.c_str(), 0, 0, 1, 1, {}};
+    ASSERT_EQ(MetricsFile::create(cp0, f0), FileStatus::Ok);
+    MetricsWriter w0;
+    EXPECT_EQ(MetricsWriter::create(f0, std::span<int32_t>(), w0), WriterStatus::Ok);
+}
+
+TEST(MetricsWriterRegression, ReadOnlyMappingRefusedRegression) {
+    metrics::testing::TestDir dir;
+    const std::string p = dir.path("ro.dat");
+    MetricsFile owner;
+    CreateParams cp{p.c_str(), 4, 4, 1, 1, {}};
+    ASSERT_EQ(MetricsFile::create(cp, owner), FileStatus::Ok);
+    EXPECT_TRUE(owner.writable());
+    MetricsFile reader;
+    ASSERT_EQ(MetricsFile::open(p.c_str(), 1, reader), FileStatus::Ok);
+    EXPECT_FALSE(reader.writable());
+    std::vector<int32_t> stack(4);
+    MetricsWriter w;
+    EXPECT_EQ(MetricsWriter::create(reader, std::span<int32_t>(stack), w), WriterStatus::ReadOnlyFile);
+    EXPECT_EQ(w.allocate(1, MetricKind::Counter, -1, {}, "x").status, AllocStatus::Full);  // would have been SIGSEGV
+    MetricsFile unmapped;
+    EXPECT_EQ(MetricsWriter::create(unmapped, std::span<int32_t>(stack), w), WriterStatus::ReadOnlyFile);
 }

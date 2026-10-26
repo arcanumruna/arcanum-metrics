@@ -14,6 +14,8 @@ inline constexpr int32_t kMetadataRecordLength = 512;
 inline constexpr int32_t kValueRecordLength = 128;
 inline constexpr int32_t kMaxKeyLength = 112;
 inline constexpr int32_t kMaxLabelLength = 364;
+// Upper bound on maxSlots: 2^20 slots is a 640 MiB file. create() and open() refuse more.
+inline constexpr int32_t kMaxSlots = 1 << 20;
 
 // Header: layoutVersion is written last with a release store.
 inline constexpr int32_t kHdrLayoutVersionOffset = 0;  // i32

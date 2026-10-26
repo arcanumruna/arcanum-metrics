@@ -20,6 +20,7 @@ static_assert(kMaxKeyLength % 4 == 0 && kMaxLabelLength % 4 == 0 && kMetaKeyOffs
 
 enum class AllocStatus : int32_t { Ok, Full, KeyTooLong, LabelTooLong, InvalidType, InvalidOwnerTag };
 enum class FreeStatus : int32_t { Ok, NotAllocated, OutOfRange };
+enum class WriterStatus : int32_t { Ok, FreeStackTooSmall, ReadOnlyFile };
 
 class SlotWriter {  // trivially copyable value type; exactly one writer thread per slot
 public:
@@ -69,14 +70,24 @@ struct NoHook {
 template <class Hook = NoHook>
 class BasicMetricsWriter {  // owner thread only
 public:
-    // freeStackStorage holds the free slots; capacity is min(maxSlots, storage size).
-    explicit BasicMetricsWriter(MetricsFile& file, std::span<int32_t> freeStackStorage, Hook hook = Hook{}) noexcept
-        : base_(file.base()),
-          layout_(file.layout()),
-          capacity_(static_cast<int32_t>(
-              std::min<int64_t>(file.layout().maxSlots, static_cast<int64_t>(freeStackStorage.size())))),
-          freeStack_(freeStackStorage.data()),
-          hook_(hook) {}
+    // An unbound writer: every allocate returns Full. Use create().
+    BasicMetricsWriter() noexcept = default;
+
+    // freeStackStorage must hold maxSlots entries (a free slot is pushed at most once); a shorter span is refused
+    // rather than silently shrinking the capacity. A read-only mapping (MetricsFile::open) is refused too.
+    // On a refusal `out` is left unbound.
+    [[nodiscard]] static WriterStatus create(MetricsFile& file, std::span<int32_t> freeStackStorage,
+                                             BasicMetricsWriter& out, Hook hook = Hook{}) noexcept {
+        out = BasicMetricsWriter{};
+        if (file.base() == nullptr || !file.writable()) return WriterStatus::ReadOnlyFile;
+        if (freeStackStorage.size() < static_cast<size_t>(file.layout().maxSlots)) return WriterStatus::FreeStackTooSmall;
+        out.base_ = file.base();
+        out.layout_ = file.layout();
+        out.capacity_ = file.layout().maxSlots;
+        out.freeStack_ = freeStackStorage.data();
+        out.hook_ = hook;
+        return WriterStatus::Ok;
+    }
 
     [[nodiscard]] AllocResult allocate(int32_t typeId, MetricKind kind, int64_t ownerTag /* -1 = none, stored as 0 */,
                                        std::span<const std::byte> key, std::string_view label) noexcept {
@@ -171,11 +182,11 @@ private:
         return std::atomic_ref<int64_t>(*reinterpret_cast<int64_t*>(m + off));
     }
 
-    std::byte* base_;
-    FileLayout layout_;
-    int32_t capacity_;
-    int32_t* freeStack_;
-    Hook hook_;
+    std::byte* base_ = nullptr;
+    FileLayout layout_{0};
+    int32_t capacity_ = 0;
+    int32_t* freeStack_ = nullptr;
+    Hook hook_{};
     int32_t freeCount_ = 0;
     int32_t nextUnused_ = 0;
     int32_t allocated_ = 0;

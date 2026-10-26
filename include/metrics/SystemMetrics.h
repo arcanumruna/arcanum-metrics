@@ -69,6 +69,9 @@ public:
     }
 
     // Returns the number of samples taken (0 or 1). Not due until intervalNs has passed on the caller's clock.
+    // The fd of the opened fd directory (it is listed in its own directory on a real /proc; see sample()).
+    [[nodiscard]] int procDirFd() const noexcept { return fdDirFd_; }
+
     int doWork(int64_t nowNs) noexcept {
         if (std::holds_alternative<Uninit>(schedule_)) return 0;
         if (const auto* s = std::get_if<Sampled>(&schedule_)) {
@@ -86,7 +89,8 @@ private:
 
     bool openAll(const char* root) noexcept {
         if (root == nullptr) return false;
-        const size_t n = std::strlen(root);
+        size_t n = 0;  // bounded: never reads past PATH_MAX bytes of an unterminated or huge root
+        while (n < PATH_MAX && root[n] != '\0') ++n;
         if (n == 0 || n + 8 >= PATH_MAX) return false;
         char path[PATH_MAX];
         std::memcpy(path, root, n);
@@ -124,6 +128,19 @@ private:
         return true;
     }
 
+    // True when `name` is the decimal text of `value`: the directory fd lists itself in /proc/self/fd and is not
+    // a descriptor the process holds for its own use.
+    static bool isNumber(const char* name, int value) noexcept {
+        char tmp[16];
+        int n = 0;
+        int v = value;
+        do { tmp[n++] = static_cast<char>('0' + v % 10); v /= 10; } while (v != 0 && n < 15);
+        for (int i = 0; i < n; ++i) {
+            if (name[i] != tmp[n - 1 - i]) return false;
+        }
+        return name[n] == '\0';
+    }
+
     void sample() noexcept {
         char buf[4096];
         bool ok = false;
@@ -134,7 +151,7 @@ private:
             if (n > 0) {
                 const char* p = buf;
                 const char* end = buf + n;
-                ok = parseU64(p, end, size) && p < end && (*p == ' ') && parseU64(p, end, resident) &&
+                ok = parseU64(p, end, size) && p < end && (*p == ' ' || *p == '\t') && parseU64(p, end, resident) &&
                      size <= static_cast<uint64_t>(INT64_MAX) / static_cast<uint64_t>(pageSize_) &&
                      resident <= static_cast<uint64_t>(INT64_MAX) / static_cast<uint64_t>(pageSize_);
             }
@@ -182,7 +199,9 @@ private:
                     std::memcpy(&reclen, dents + off + 16, sizeof reclen);
                     if (reclen == 0) { ok = false; break; }
                     const char* name = dents + off + 19;
-                    if (!(name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))) ++count;
+                    if (!(name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) && !isNumber(name, fdDirFd_)) {
+                        ++count;
+                    }
                     off += reclen;
                 }
             }

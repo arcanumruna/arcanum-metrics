@@ -4,9 +4,11 @@
 //  - 4 writer threads, each owns 8 slots and adds 1 to each, kWriterIterations times;
 //  - the allocator thread (owner of MetricsWriter) frees and reallocates one block of 8 slots kBlockCycles times,
 //    each cycle under a new owner tag, writing tag * 1e9 + k into the block's slots;
-//  - a reader thread scans continuously until the "done" slot, written by the main thread, reads 1.
+//  - a reader thread scans continuously until the "done" slot, written by the main thread, reads 1; the main
+//    thread stores "joined" first, and the reader then has a bounded number of scans to see "done".
 // The reader never reads key or label bytes: those are plain bytes by design and are only valid until reuse.
 #include "TestDir.h"
+#include "TestHelpers.h"
 
 #include "metrics/MetricsFile.h"
 #include "metrics/MetricsReader.h"
@@ -32,17 +34,22 @@ constexpr int kUpdatesPerCycle = 3;
 constexpr int64_t kRegIdScale = 1'000'000'000;
 constexpr int64_t kFirstBlockRegId = 1000;
 constexpr int kBlockFirstSlot = kWriters * kSlotsPerWriter;
-constexpr int kDoneSlot = kBlockFirstSlot + kBlockSlots;
+constexpr int kJoinedSlot = kBlockFirstSlot + kBlockSlots;  // main: writers and allocator have been joined
+constexpr int kDoneSlot = kJoinedSlot + 1;                  // main: stored right after "joined"
 constexpr int kTotalSlots = kDoneSlot + 1;
 constexpr uint64_t kSeed = 0x5EEDC0DEULL;
-constexpr int64_t kMaxScans = 400'000'000;  // hard cap: a stuck run fails instead of hanging
+// Hard caps: a stuck run fails in seconds instead of hanging. A normal run needs about 25 thousand scans before
+// "joined" (the writers take seconds); once "joined" is visible, "done" must follow within kScansAfterJoined.
+constexpr int64_t kMaxScansBeforeJoined = 400'000;  // about 16x the scans of a normal TSan run
+constexpr int64_t kScansAfterJoined = 10'000;
 
 struct ReaderResult {
     int64_t scans = 0;
     int64_t violations = 0;
     int64_t blockTagsSeen = 0;
     int64_t reusedSeen = 0;
-    bool timedOut = false;
+    bool timedOut = false;     // never saw "joined" within the cap
+    bool missedDone = false;   // saw "joined" but not "done" within kScansAfterJoined scans
 };
 
 void readerLoop(const MetricsFile& file, ReaderResult& out) {
@@ -50,7 +57,11 @@ void readerLoop(const MetricsFile& file, ReaderResult& out) {
     struct Last { int64_t regId = -1; int64_t value = 0; };
     std::array<Last, kTotalSlots> last{};
     int64_t lastBlockTag = -1;
-    for (int64_t scan = 0; scan < kMaxScans; ++scan) {
+    int64_t scansSinceJoined = -1;  // -1: not joined yet
+    for (int64_t scan = 0;; ++scan) {
+        if (scansSinceJoined < 0 && scan >= kMaxScansBeforeJoined) { out.timedOut = true; return; }
+        if (scansSinceJoined >= kScansAfterJoined) { out.missedDone = true; return; }
+        if (scansSinceJoined >= 0) ++scansSinceJoined;
         ++out.scans;
         bool done = false;
         for (int32_t s = 0; s < kTotalSlots; ++s) {
@@ -64,20 +75,21 @@ void readerLoop(const MetricsFile& file, ReaderResult& out) {
             lv.value = l->value;
             if (s < kBlockFirstSlot) {
                 if (l->value < 0 || l->value > kWriterIterations) ++out.violations;
-            } else if (s < kDoneSlot) {
+            } else if (s < kJoinedSlot) {
                 // the block writes ownerTag * 1e9 + k; 0 is the zeroed value before its first update
                 if (l->value != 0 && (l->value / kRegIdScale != l->ownerTag ||
                                       l->value % kRegIdScale > kUpdatesPerCycle)) {
                     ++out.violations;
                 }
                 if (l->ownerTag != lastBlockTag) { ++out.blockTagsSeen; lastBlockTag = l->ownerTag; }
+            } else if (s == kJoinedSlot) {
+                if (l->value == 1 && scansSinceJoined < 0) scansSinceJoined = 0;
             } else if (l->value == 1) {
                 done = true;
             }
         }
         if (done) return;
     }
-    out.timedOut = true;
 }
 }  // namespace
 
@@ -88,7 +100,7 @@ TEST(MetricsConcurrencyRegression, WriterReaderAllocatorUnderTsanRegression) {
     CreateParams cp{path.c_str(), kTotalSlots, kTotalSlots, 1, 1, {}};
     ASSERT_EQ(MetricsFile::create(cp, file), FileStatus::Ok);
     std::vector<int32_t> stack(kTotalSlots + 1);
-    MetricsWriter alloc(file, stack);
+    MetricsWriter alloc = metrics::testing::makeWriter(file, stack);
 
     // Allocation order fixes the slot numbers: writer slots 0..31, block 32..39, done 40. The block is
     // allocated by the allocator thread below; here the writer slots and "done" are allocated, then the block
@@ -107,6 +119,8 @@ TEST(MetricsConcurrencyRegression, WriterReaderAllocatorUnderTsanRegression) {
         ASSERT_EQ(r.status, AllocStatus::Ok);
         block0[static_cast<size_t>(i)] = r.writer;
     }
+    const AllocResult joinedR = alloc.allocate(31, MetricKind::Gauge, -1, {}, "joined");
+    ASSERT_EQ(joinedR.writer.slot(), kJoinedSlot);
     const AllocResult doneR = alloc.allocate(30, MetricKind::Gauge, -1, {}, "done");
     ASSERT_EQ(doneR.status, AllocStatus::Ok);
     ASSERT_EQ(doneR.writer.slot(), kDoneSlot);
@@ -146,10 +160,13 @@ TEST(MetricsConcurrencyRegression, WriterReaderAllocatorUnderTsanRegression) {
 
     for (std::thread& t : writers) t.join();
     allocator.join();
-    doneR.writer.set(1);  // main is this slot's single writer
+    joinedR.writer.set(1);  // main is the single writer of both slots
+    doneR.writer.set(1);
     reader.join();
 
-    EXPECT_FALSE(result.timedOut);
+    RecordProperty("reader_scans", std::to_string(result.scans));
+    EXPECT_FALSE(result.timedOut) << "the reader never saw 'joined' in " << result.scans << " scans";
+    EXPECT_FALSE(result.missedDone) << "'done' was not visible " << kScansAfterJoined << " scans after 'joined'";
     EXPECT_EQ(result.violations, 0);
     EXPECT_GT(result.scans, 0);
     EXPECT_GT(result.blockTagsSeen, 0) << "the reader never overlapped the allocator: vacuous run";

@@ -1,5 +1,6 @@
 #include "AllocCounter.h"
 #include "TestDir.h"
+#include "TestHelpers.h"
 
 #include "metrics/MetricsFile.h"
 #include "metrics/MetricsReader.h"
@@ -52,7 +53,7 @@ struct ReuseHook {
 
 TEST(MetricsReaderRegression, ReadStatesTable) {
     Env env(4);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     const auto key = bytes(4, 0x11);
     auto a = w.allocate(42, MetricKind::Gauge, 9, key, "lab");  // 9 is the owner tag
     a.writer.set(-5);
@@ -82,7 +83,7 @@ TEST(MetricsReaderRegression, ReadStatesTable) {
 TEST(MetricsReaderRegression, ReuseMidReadDetectedRegression) {
     for (ReadStep when : {ReadStep::AfterFirstRegId, ReadStep::AfterValue}) {
         Env env(2);
-        MetricsWriter w(env.file, env.stack);
+        MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
         auto a = w.allocate(1, MetricKind::Counter, -1, {}, "old");
         a.writer.set(5);
         ReuseState st{&w, when, false};
@@ -102,7 +103,7 @@ TEST(MetricsReaderRegression, ReuseMidReadDetectedRegression) {
 
 TEST(MetricsReaderRegression, ForEachLiveRetriesReusedOnceRegression) {
     Env env(2);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, -1, {}, "old");
     a.writer.set(5);
     ReuseState st{&w, ReadStep::AfterValue, false};
@@ -116,29 +117,30 @@ TEST(MetricsReaderRegression, ForEachLiveRetriesReusedOnceRegression) {
 
 TEST(MetricsReaderRegression, FindFirstByTypeAndKeyRegression) {
     Env env(5);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     const auto k1 = bytes(4, 1), k2 = bytes(4, 2), k3 = bytes(3, 2);
     auto a = w.allocate(7, MetricKind::Counter, -1, k1, "a");
     auto b = w.allocate(7, MetricKind::Counter, -1, k2, "b");
     auto c = w.allocate(8, MetricKind::Counter, -1, k2, "c");
     MetricsReader r(env.file);
-    EXPECT_EQ(r.findFirst(7, k1), a.writer.slot());
-    EXPECT_EQ(r.findFirst(7, k2), b.writer.slot());
-    EXPECT_EQ(r.findFirst(8, k2), c.writer.slot());
-    EXPECT_EQ(r.findFirst(7, k3), -1);
-    EXPECT_EQ(r.findFirst(9, k1), -1);
+    EXPECT_EQ(r.findFirst(7, k1).slot, a.writer.slot());
+    EXPECT_EQ(r.findFirst(7, k1).regId, a.regId);
+    EXPECT_EQ(r.findFirst(7, k2).slot, b.writer.slot());
+    EXPECT_EQ(r.findFirst(8, k2).slot, c.writer.slot());
+    EXPECT_EQ(r.findFirst(7, k3).slot, -1);
+    EXPECT_EQ(r.findFirst(9, k1).slot, -1);
     ASSERT_EQ(w.free(b.writer.slot()), FreeStatus::Ok);
-    EXPECT_EQ(r.findFirst(7, k2), -1);  // a freed match is skipped
+    EXPECT_EQ(r.findFirst(7, k2).slot, -1);  // a freed match is skipped
     auto d = w.allocate(7, MetricKind::Counter, -1, k2, "d");
-    EXPECT_EQ(r.findFirst(7, k2), d.writer.slot());
+    EXPECT_EQ(r.findFirst(7, k2).slot, d.writer.slot());
 }
 
 TEST(RateTrackerRegression, RateFromTotalsRegression) {
     Env env(2);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, -1, {}, "a");
     MetricsReader r(env.file);
-    auto rt = std::make_unique<RateTracker<2, 4>>();
+    auto rt = metrics::testing::makeRates<2, 4>(r);
     constexpr int64_t S = 1'000'000'000;
     a.writer.set(0);
     rt->sample(r, 0);
@@ -161,10 +163,10 @@ TEST(RateTrackerRegression, RateFromTotalsRegression) {
 
 TEST(RateTrackerRegression, RestartOnReuseRegression) {
     Env env(1);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, -1, {}, "a");
     MetricsReader r(env.file);
-    auto rt = std::make_unique<RateTracker<1, 4>>();
+    auto rt = metrics::testing::makeRates<1, 4>(r);
     constexpr int64_t S = 1'000'000'000;
     a.writer.set(1'000'000);
     rt->sample(r, 0);
@@ -188,10 +190,10 @@ TEST(RateTrackerRegression, RestartOnReuseRegression) {
 
 TEST(RateTrackerRegression, WrapIsOneDeltaRegression) {
     Env env(1);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, -1, {}, "a");
     MetricsReader r(env.file);
-    auto rt = std::make_unique<RateTracker<1, 4>>();
+    auto rt = metrics::testing::makeRates<1, 4>(r);
     constexpr int64_t S = 1'000'000'000;
     a.writer.set(INT64_MAX - 499);
     rt->sample(r, 0);
@@ -203,10 +205,10 @@ TEST(RateTrackerRegression, WrapIsOneDeltaRegression) {
 
 TEST(WindowSamplerRegression, MaxAvgTable) {
     Env env(2);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Gauge, -1, {}, "a");
     MetricsReader r(env.file);
-    auto ws = std::make_unique<WindowSampler<2, 4>>();
+    auto ws = metrics::testing::makeWindow<2, 4>(r);
     EXPECT_FALSE(ws->max(0).has_value());
     EXPECT_FALSE(ws->avg(0).has_value());
 
@@ -249,11 +251,11 @@ TEST(WindowSamplerRegression, MaxAvgTable) {
 
 TEST(MetricsReaderRegression, ZeroAllocScanRegression) {
     Env env(8);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     for (int i = 0; i < 5; ++i) w.allocate(i + 1, MetricKind::Counter, -1, bytes(4, 3), "x").writer.set(i);
     MetricsReader r(env.file);
-    auto rt = std::make_unique<RateTracker<8, 4>>();
-    auto ws = std::make_unique<WindowSampler<8, 4>>();
+    auto rt = metrics::testing::makeRates<8, 4>(r);
+    auto ws = metrics::testing::makeWindow<8, 4>(r);
     int seen = 0;
     int32_t found = 0;
     const auto probeKey = bytes(4, 3);
@@ -265,7 +267,7 @@ TEST(MetricsReaderRegression, ZeroAllocScanRegression) {
         (void)rt->perSecond(1);
         (void)ws->max(1);
         (void)ws->avg(1);
-        found += r.findFirst(3, probeKey);
+        found += r.findFirst(3, probeKey).slot;
     }
     EXPECT_EQ(scope.count(), 0);
     EXPECT_EQ(seen, 50);
@@ -303,7 +305,7 @@ struct RawHook {
 TEST(MetricsReaderRegression, StaleRegIdWithZeroedValueRegression) {
     for (int64_t newRegId : {int64_t{-1}, int64_t{500}}) {
         Env env(1);
-        MetricsWriter w(env.file, env.stack);
+        MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
         auto a = w.allocate(1, MetricKind::Counter, -1, {}, "old");
         a.writer.set(12345);
         RawState st{&env.file, newRegId, false};
@@ -322,7 +324,7 @@ TEST(MetricsReaderRegression, StaleRegIdWithZeroedValueRegression) {
 // ---- regId is unique per allocation; a caller's id is only an owner tag -----------------------------------
 TEST(MetricsReaderRegression, AutoExplicitRegIdCollisionRegression) {
     Env env(4);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, -1, {}, "auto");  // first regId
     auto b = w.allocate(1, MetricKind::Counter, a.regId, {}, "explicit");  // asks for the same number as a tag
     auto c = w.allocate(1, MetricKind::Counter, 1, {}, "explicit1");
@@ -338,10 +340,10 @@ TEST(MetricsReaderRegression, AutoExplicitRegIdCollisionRegression) {
 
 TEST(MetricsReaderRegression, SameRegIdReuseRegression) {
     Env env(1);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, 5, {}, "old");
     MetricsReader r(env.file);
-    auto rt = std::make_unique<RateTracker<1, 4>>();
+    auto rt = metrics::testing::makeRates<1, 4>(r);
     constexpr int64_t S = 1'000'000'000;
     a.writer.set(1000);
     rt->sample(r, 0);
@@ -362,10 +364,10 @@ TEST(MetricsReaderRegression, SameRegIdReuseRegression) {
 
 TEST(RateTrackerRegression, NegativeDeltaRestartsRegression) {
     Env env(1);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, -1, {}, "a");
     MetricsReader r(env.file);
-    auto rt = std::make_unique<RateTracker<1, 4>>();
+    auto rt = metrics::testing::makeRates<1, 4>(r);
     constexpr int64_t S = 1'000'000'000;
     a.writer.set(2000);
     rt->sample(r, 0);
@@ -396,7 +398,7 @@ struct SameTagHook {
 
 TEST(MetricsReaderRegression, SameRegIdReuseMixesOwnersRegression) {
     Env env(1);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, 5, {}, "old");
     a.writer.set(4242);
     SameTagState st{&w};
@@ -409,10 +411,10 @@ TEST(MetricsReaderRegression, SameRegIdReuseMixesOwnersRegression) {
 
 TEST(WindowSamplerRegression, ReuseUnderSameOwnerTagRestartsRegression) {
     Env env(1);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Gauge, 5, {}, "old");
     MetricsReader r(env.file);
-    auto ws = std::make_unique<WindowSampler<1, 4>>();
+    auto ws = metrics::testing::makeWindow<1, 4>(r);
     a.writer.set(100);
     ws->sample(r, 0);
     a.writer.set(200);
@@ -430,7 +432,7 @@ TEST(WindowSamplerRegression, ReuseUnderSameOwnerTagRestartsRegression) {
 // one owner with the value of another, and never races the allocator rewriting the label bytes.
 TEST(MetricsReaderRegression, LabelRacesReallocateRegression) {
     Env env(2);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     const AllocResult done = w.allocate(30, MetricKind::Gauge, -1, {}, "done");  // slot 0, written by main only
     (void)w.allocate(1, MetricKind::Gauge, -1, {}, "A");                          // slot 1 is the one reused
     (void)w.free(1);
@@ -469,7 +471,7 @@ TEST(MetricsReaderRegression, LabelRacesReallocateRegression) {
 TEST(MetricsReaderRegression, LabelCopiedBeforeCheckRegression) {
     for (ReadStep when : {ReadStep::AfterFirstRegId, ReadStep::AfterValue}) {
         Env env(2);
-        MetricsWriter w(env.file, env.stack);
+        MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
         auto a = w.allocate(1, MetricKind::Counter, -1, bytes(4, 7), "old-label");
         a.writer.set(5);
         ReuseState st{&w, when, false};  // frees the slot and allocates "new" with value 777
@@ -488,7 +490,7 @@ TEST(MetricsReaderRegression, LabelCopiedBeforeCheckRegression) {
 
 TEST(MetricsReaderRegression, LiveIsACopyRegression) {
     Env env(1);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, -1, bytes(3, 9), "first");
     MetricsReader r(env.file);
     const Live copy = std::get<Live>(r.read(0));
@@ -505,4 +507,34 @@ TEST(MetricsReaderRegression, LiveIsACopyRegression) {
     EXPECT_FALSE(reinterpret_cast<const char*>(copy.key().data()) >= base &&
                  reinterpret_cast<const char*>(copy.key().data()) < base + env.file.length());
     (void)a;
+}
+
+TEST(RateTrackerRegression, CapacitySmallerThanReaderRefusedRegression) {
+    Env env(3);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
+    for (int i = 0; i < 3; ++i) w.allocate(1, MetricKind::Counter, -1, {}, "x").writer.set(10 * (i + 1));
+    MetricsReader r(env.file);
+    constexpr int64_t S = 1'000'000'000;
+    {
+        RateTracker<2, 4> small;  // 2 < 3 slots
+        EXPECT_EQ(small.bind(r), TrackerStatus::CapacityTooSmall);
+        small.sample(r, 0);       // unbound: samples nothing, never a silent partial scan
+        small.sample(r, S);
+        for (int32_t s = 0; s < 4; ++s) EXPECT_FALSE(small.perSecond(s).has_value());
+    }
+    {
+        WindowSampler<2, 4> small;
+        EXPECT_EQ(small.bind(r), TrackerStatus::CapacityTooSmall);
+        small.sample(r, 0);
+        for (int32_t s = 0; s < 4; ++s) EXPECT_FALSE(small.max(s).has_value());
+    }
+    RateTracker<3, 4> exact;
+    EXPECT_EQ(exact.bind(r), TrackerStatus::Ok);
+    RateTracker<8, 4> bigger;
+    EXPECT_EQ(bigger.bind(r), TrackerStatus::Ok);
+    WindowSampler<3, 4> wexact;
+    EXPECT_EQ(wexact.bind(r), TrackerStatus::Ok);
+    exact.sample(r, 0);
+    exact.sample(r, S);
+    EXPECT_TRUE(exact.perSecond(2).has_value());
 }

@@ -261,3 +261,47 @@ TEST_F(MetricsFileRegression, NoFlockRegression) {
     ASSERT_EQ(::waitpid(pid, &status, 0), pid);
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
+
+// A recreated file with the same pid, start time and size is still a different file: compare dev + inode.
+TEST_F(MetricsFileRegression, SameInstanceComparesInodeRegression) {
+    MetricsFile w1;
+    ASSERT_EQ(MetricsFile::create(params(4, 777), w1), FileStatus::Ok);
+    MetricsFile reader;
+    ASSERT_EQ(MetricsFile::open(path_.c_str(), 1, reader), FileStatus::Ok);
+    EXPECT_TRUE(reader.sameInstanceAs(path_.c_str()));
+    MetricsFile w2;
+    ASSERT_EQ(MetricsFile::create(params(4, 777), w2), FileStatus::Ok);  // identical header fields, new inode
+    EXPECT_FALSE(reader.sameInstanceAs(path_.c_str()));
+    EXPECT_TRUE(w2.sameInstanceAs(path_.c_str()));
+    // A file replaced by a different size is a different instance too.
+    MetricsFile w3;
+    ASSERT_EQ(MetricsFile::create(params(8, 777), w3), FileStatus::Ok);
+    EXPECT_FALSE(w2.sameInstanceAs(path_.c_str()));
+}
+
+TEST_F(MetricsFileRegression, MaxSlotsBoundRegression) {
+    MetricsFile f;
+    CreateParams p{path_.c_str(), kMaxSlots + 1, 1, 1, 1, {}};
+    EXPECT_EQ(MetricsFile::create(p, f), FileStatus::TooLarge);
+    EXPECT_EQ(countEntries(), 0);
+    CreateParams neg{path_.c_str(), -1, 0, 1, 1, {}};
+    EXPECT_NE(MetricsFile::create(neg, f), FileStatus::Ok);
+    EXPECT_EQ(countEntries(), 0);
+    EXPECT_EQ(kMaxSlots, 1 << 20);
+}
+
+TEST_F(MetricsFileRegression, CreateWithRelativePathsRegression) {
+    // The parent directory is synced after the rename: a bare file name (parent ".") and a nested one both work.
+    char cwd[PATH_MAX];
+    ASSERT_NE(::getcwd(cwd, sizeof cwd), nullptr);
+    ASSERT_EQ(::chdir(dir_.c_str()), 0);
+    ASSERT_EQ(::mkdir("sub", 0750), 0);
+    MetricsFile a, b;
+    EXPECT_EQ(MetricsFile::create(CreateParams{"bare.dat", 2, 2, 1, 1, {}}, a), FileStatus::Ok);
+    EXPECT_EQ(MetricsFile::create(CreateParams{"sub/nested.dat", 2, 2, 1, 1, {}}, b), FileStatus::Ok);
+    EXPECT_TRUE(a.sameInstanceAs("bare.dat"));
+    EXPECT_TRUE(b.sameInstanceAs("sub/nested.dat"));
+    ASSERT_EQ(::chdir(cwd), 0);
+    ::unlink((dir_ + "/sub/nested.dat").c_str());
+    ::rmdir((dir_ + "/sub").c_str());
+}

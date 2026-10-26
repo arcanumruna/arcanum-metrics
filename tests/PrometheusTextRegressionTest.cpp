@@ -1,5 +1,6 @@
 #include "AllocCounter.h"
 #include "TestDir.h"
+#include "TestHelpers.h"
 
 #include "metrics/MetricsFile.h"
 #include "metrics/MetricsReader.h"
@@ -44,7 +45,7 @@ const char* kRateHead =
 
 TEST(PrometheusTextRegression, RenderTable) {
     Env env(8);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto c = w.allocate(1000201, MetricKind::Counter, -1, {}, "node=\"1\"");   // regId 1
     auto g = w.allocate(5, MetricKind::Gauge, -1, {}, "a\\b\nc");              // regId 2
     auto c2 = w.allocate(7, MetricKind::Counter, -1, {}, "");                    // regId 3
@@ -54,7 +55,7 @@ TEST(PrometheusTextRegression, RenderTable) {
     g.writer.set(-7);
     c2.writer.set(3);
     MetricsReader r(env.file);
-    auto rt = std::make_unique<RateTracker<8, 4>>();
+    auto rt = metrics::testing::makeRates<8, 4>(r);
 
     char buf[4096];
     // First scrape: one sample, so no rate yet. The caller samples; render does not.
@@ -101,11 +102,11 @@ TEST(PrometheusTextRegression, RenderTable) {
 // A rate belongs to a regId: after the slot is reused, the new owner shows no rate until it is sampled twice.
 TEST(PrometheusTextRegression, RateAfterReuseRegression) {
     Env env(2);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     auto a = w.allocate(1, MetricKind::Counter, -1, {}, "old");
     a.writer.set(100);
     MetricsReader r(env.file);
-    auto rt = std::make_unique<RateTracker<2, 4>>();
+    auto rt = metrics::testing::makeRates<2, 4>(r);
     rt->sample(r, 0);
     a.writer.set(1100);
     rt->sample(r, S);
@@ -140,10 +141,10 @@ TEST(PrometheusTextRegression, PrometheusSinglePassRegression) {
     for (int fireAt = 1; fireAt <= 8; ++fireAt) {
         for (size_t cap : {size_t{0}, size_t{40}, size_t{300}, size_t{700}, size_t{4096}}) {
             Env env(8);
-            MetricsWriter w(env.file, env.stack);
+            MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
             w.allocate(1, MetricKind::Counter, -1, {}, "x").writer.set(5);
             MetricsReader plain(env.file);
-            auto rt = std::make_unique<RateTracker<8, 4>>();
+            auto rt = metrics::testing::makeRates<8, 4>(plain);
             rt->sample(plain, 0);
             rt->sample(plain, S);
             GrowState st{&w, 0, fireAt, false};
@@ -166,11 +167,11 @@ TEST(PrometheusTextRegression, PrometheusSinglePassRegression) {
 
 TEST(PrometheusTextRegression, ZeroAllocRenderRegression) {
     Env env(4);
-    MetricsWriter w(env.file, env.stack);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
     w.allocate(1, MetricKind::Counter, -1, {}, "x").writer.set(5);
     w.allocate(2, MetricKind::Gauge, -1, {}, "y").writer.set(6);
     MetricsReader r(env.file);
-    auto rt = std::make_unique<RateTracker<4, 4>>();
+    auto rt = metrics::testing::makeRates<4, 4>(r);
     char buf[1024];
     char tiny[8];
     metrics::testing::AllocScope scope;

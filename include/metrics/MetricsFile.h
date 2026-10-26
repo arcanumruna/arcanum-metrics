@@ -27,7 +27,8 @@ enum class FileStatus : int32_t {
     IoError,
     NotReady,
     VersionMismatch,
-    BadLength
+    BadLength,
+    TooLarge  // maxSlots above kMaxSlots
 };
 
 struct CreateParams {
@@ -39,6 +40,7 @@ struct CreateParams {
     std::span<const std::byte> userTag;
 };
 
+// Two concurrent create() calls for the same path in one process are a caller error (the tmp name is per process).
 class MetricsFile {
 public:
     // Room for ".tmp." and a 20-digit pid in the tmp name, plus the terminating NUL.
@@ -55,6 +57,9 @@ public:
             length_ = o.length_;
             maxSlots_ = o.maxSlots_;
             polls_ = o.polls_;
+            writable_ = o.writable_;
+            dev_ = o.dev_;
+            ino_ = o.ino_;
             o.base_ = nullptr;
             o.length_ = 0;
             o.maxSlots_ = 0;
@@ -68,6 +73,7 @@ public:
         if (pathLen == 0 || pathLen > kMaxPathLength) return FileStatus::PathTooLong;
         if (p.requiredSlots > INT32_MAX) return FileStatus::CapacityTooLarge;
         if (p.maxSlots < 0 || int64_t{p.maxSlots} < p.requiredSlots) return FileStatus::CapacityTooSmall;
+        if (p.maxSlots > kMaxSlots) return FileStatus::TooLarge;
         if (p.userTag.size() > static_cast<size_t>(kHdrUserTagLength)) return FileStatus::BadLength;
 
         char tmp[PATH_MAX];
@@ -102,13 +108,23 @@ public:
             store<int32_t>(b, kHdrValueRecordLengthOffset, kValueRecordLength);
             if (!p.userTag.empty()) std::memcpy(b + kHdrUserTagOffset, p.userTag.data(), p.userTag.size());
             versionRef(b).store(kLayoutVersion, std::memory_order_release);  // last
-            if (::fsync(fd) == 0 && ::rename(tmp, p.path) == 0) {
-                out.release();
-                out.base_ = b;
-                out.length_ = static_cast<size_t>(length);
-                out.maxSlots_ = p.maxSlots;
-                out.polls_ = 0;
-                st = FileStatus::Ok;
+            struct stat sb;
+            if (::fsync(fd) == 0 && ::fstat(fd, &sb) == 0 && ::rename(tmp, p.path) == 0) {
+                if (syncParentDirectory(p.path, pathLen)) {
+                    out.release();
+                    out.base_ = b;
+                    out.length_ = static_cast<size_t>(length);
+                    out.maxSlots_ = p.maxSlots;
+                    out.polls_ = 0;
+                    out.writable_ = true;
+                    out.dev_ = sb.st_dev;
+                    out.ino_ = sb.st_ino;
+                    st = FileStatus::Ok;
+                } else {
+                    ::munmap(m, static_cast<size_t>(length));  // renamed but not durable: the caller must not trust it
+                    ::close(fd);
+                    return FileStatus::IoError;
+                }
             } else {
                 ::munmap(m, static_cast<size_t>(length));
             }
@@ -157,7 +173,8 @@ public:
             if (load<int32_t>(b, kHdrMetadataRecordLengthOffset) != kMetadataRecordLength ||
                 load<int32_t>(b, kHdrValueRecordLengthOffset) != kValueRecordLength) {
                 st = FileStatus::VersionMismatch;
-            } else if (maxSlots < 0 || FileLayout{maxSlots}.fileLength() > static_cast<int64_t>(size)) {
+            } else if (maxSlots < 0 || maxSlots > kMaxSlots ||
+                       FileLayout{maxSlots}.fileLength() > static_cast<int64_t>(size)) {
                 st = FileStatus::BadLength;
             }
         }
@@ -169,21 +186,27 @@ public:
         out.base_ = b;
         out.length_ = size;
         out.maxSlots_ = maxSlots;
+        out.writable_ = false;
+        out.dev_ = sb.st_dev;
+        out.ino_ = sb.st_ino;
         return FileStatus::Ok;
     }
 
-    // True when the file now at `path` is this mapping's file (same pid and startEpochNs in its header).
+    // True when the file now at `path` is this mapping's file: same device, inode and size, and the same pid and
+    // startEpochNs in its header (a recreated file with identical header fields still has a new inode).
     [[nodiscard]] bool sameInstanceAs(const char* path) const noexcept {
         if (base_ == nullptr) return false;
         const size_t pathLen = boundedLength(path);
         if (pathLen == 0 || pathLen > kMaxPathLength) return false;
         const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) return false;
+        struct stat sb;
         std::byte hdr[kHdrStartEpochNsOffset + 8];
-        const ssize_t got = ::pread(fd, hdr, sizeof hdr, 0);
+        const bool ok = ::fstat(fd, &sb) == 0 && ::pread(fd, hdr, sizeof hdr, 0) == static_cast<ssize_t>(sizeof hdr);
         ::close(fd);
-        if (got != static_cast<ssize_t>(sizeof hdr)) return false;
-        return load<int64_t>(hdr, kHdrPidOffset) == load<int64_t>(base_, kHdrPidOffset) &&
+        if (!ok) return false;
+        return sb.st_dev == dev_ && sb.st_ino == ino_ && static_cast<size_t>(sb.st_size) == length_ &&
+               load<int64_t>(hdr, kHdrPidOffset) == load<int64_t>(base_, kHdrPidOffset) &&
                load<int64_t>(hdr, kHdrStartEpochNsOffset) == load<int64_t>(base_, kHdrStartEpochNsOffset);
     }
 
@@ -191,6 +214,8 @@ public:
     // Writable only for a mapping made by create(); an open() mapping is read-only.
     [[nodiscard]] std::byte* base() const noexcept { return base_; }
     [[nodiscard]] size_t length() const noexcept { return length_; }
+    // True for a mapping made by create(); an open() mapping is read-only and must not be written through.
+    [[nodiscard]] bool writable() const noexcept { return writable_; }
     // Version-word polls made by the last open() into this object.
     [[nodiscard]] int32_t openPolls() const noexcept { return polls_; }
 
@@ -200,6 +225,25 @@ private:
         size_t n = 0;
         while (n <= PATH_MAX && s[n] != '\0') ++n;
         return n;
+    }
+    // fsync of the directory holding `path`, so the rename itself is durable.
+    static bool syncParentDirectory(const char* path, size_t pathLen) noexcept {
+        char dir[PATH_MAX];
+        size_t slash = pathLen;
+        while (slash > 0 && path[slash - 1] != '/') --slash;
+        if (slash == 0) {
+            dir[0] = '.';
+            dir[1] = '\0';
+        } else {
+            const size_t n = slash == 1 ? 1 : slash - 1;  // keep "/" for a file in the root
+            std::memcpy(dir, path, n);
+            dir[n] = '\0';
+        }
+        const int dfd = ::open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd < 0) return false;
+        const bool ok = ::fsync(dfd) == 0;
+        ::close(dfd);
+        return ok;
     }
     static size_t writeDecimal(char* dst, uint64_t v) noexcept {
         char rev[20];
@@ -229,6 +273,9 @@ private:
     size_t length_ = 0;
     int32_t maxSlots_ = 0;
     int32_t polls_ = 0;
+    bool writable_ = false;
+    dev_t dev_ = 0;
+    ino_t ino_ = 0;
 };
 
 }  // namespace metrics

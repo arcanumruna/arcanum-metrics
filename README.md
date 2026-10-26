@@ -68,10 +68,11 @@ Little-endian. `[header 4096 B][maxSlots x 512 B metadata][maxSlots x 128 B valu
 
 A value record is an `i64` at offset 0, padded to 128 bytes (two cache lines) against false sharing.
 
-Creating a file is `<path>.tmp.<pid>` (`O_CREAT|O_EXCL`), `ftruncate`, header with `layoutVersion = 0`, release store
-of the version, `fsync`, `rename` over `<path>`. A reader that still maps the old file keeps reading its inode until
-it re-opens; there is no `O_TRUNC` and no `flock`. A reader re-opens when `sameInstanceAs(path)` is false (the `pid`
-or `startEpochNs` at the path differs from its mapping). A reader that opens a file being created polls the version
+`maxSlots` is capped at `kMaxSlots` (2^20; `TooLarge`). Creating a file is `<path>.tmp.<pid>` (`O_CREAT|O_EXCL`), `ftruncate`, header with `layoutVersion = 0`, release store
+of the version, `fsync`, `rename` over `<path>`, then `fsync` of the parent directory. Two concurrent `create` calls for the same path
+in one process are a caller error. A reader that still maps the old file keeps reading its inode until
+it re-opens; there is no `O_TRUNC` and no `flock`. A reader re-opens when `sameInstanceAs(path)` is false (the device,
+inode or size at the path, or its `pid` or `startEpochNs`, differs from its mapping). A reader that opens a file being created polls the version
 word a bounded number of times and then fails with `NotReady`; it never reads a half-written header.
 
 ## Writer
@@ -84,9 +85,10 @@ metrics::CreateParams params{path, maxSlots, metrics::requiredSlots(plan), pid, 
 if (metrics::MetricsFile::create(params, file) != metrics::FileStatus::Ok) { /* refuse to start */ }
 
 std::vector<int32_t> freeStack(maxSlots);            // storage for the free list, owned by the caller
-metrics::MetricsWriter writer(file, freeStack);
+metrics::MetricsWriter writer;
+if (metrics::MetricsWriter::create(file, freeStack, writer) != metrics::WriterStatus::Ok) { /* refuse */ }
 
-auto r = writer.allocate(/*typeId*/ 1'000'201, metrics::MetricKind::Gauge, /*regId*/ -1, key, "label text");
+auto r = writer.allocate(/*typeId*/ 1'000'201, metrics::MetricKind::Gauge, /*ownerTag*/ -1, key, "label text");
 if (r.status != metrics::AllocStatus::Ok) { /* fatal at startup: log the metric's name */ }
 metrics::SlotWriter slot = r.writer;                 // trivially copyable; give it to exactly one writer thread
 slot.add(1);                                         // Counter
@@ -94,12 +96,19 @@ slot.set(42);                                        // Gauge
 (void)writer.free(slot.slot());                      // owner thread only
 ```
 
-- `allocate` checks its arguments first (`InvalidType`: negative type id or unknown kind; `InvalidRegId`: below -1;
-  `KeyTooLong` above 112 bytes; `LabelTooLong` above 364 bytes), then takes a free slot (LIFO) or the next unused
-  one, or returns `Full`. A failed call changes nothing in the file.
-- It zeroes the value (release), writes the regId (release), then sets the state to `Allocated` (release), so a new
-  owner never inherits the old total. `regId = -1` takes the next number from the allocator's counter; an explicit
-  regId (including a duplicate) is allowed, e.g. one regId for a block of slots.
+- `MetricsWriter::create` refuses a free-stack span shorter than `maxSlots` (`FreeStackTooSmall`) and a read-only
+  mapping from `MetricsFile::open` (`ReadOnlyFile`); it never shrinks the capacity silently.
+- **regId and ownerTag.** The `regId` of every allocation is the allocator's own counter: it starts at 1, increases
+  by one per successful `allocate`, and is never reused for the writer's life, so two live slots never share one and
+  a reused slot always shows a new regId. The third argument of `allocate` is an **owner tag** (`-1` means none, stored
+  as 0; below -1 is `InvalidOwnerTag`). It is stored in the metadata (`Live::ownerTag`) and may repeat across slots,
+  e.g. one namespace id for a block of slots. It is *not* a regId: 1.x-style "pass my own regId" no longer exists.
+- `allocate` checks its arguments first (`InvalidType`: negative type id or unknown kind; `KeyTooLong` above 112
+  bytes; `LabelTooLong` above 364 bytes), then takes a free slot (LIFO) or the next unused one, or returns `Full`. A
+  failed call changes nothing in the file.
+- Publication order: a release fence, then the key and label (relaxed 32-bit word stores, zero-filled), the scalars
+  (relaxed), the value zeroed (release), the regId (release), and finally the state set to `Allocated` (release). A
+  new owner never inherits the old total.
 - There is no reuse grace period: a freed slot is reused at once. Readers detect reuse by the regId, so no timing
   constant is involved.
 - `add` wraps in two's complement across `INT64_MAX`.
@@ -113,27 +122,36 @@ metrics::MetricsFile file;
 if (metrics::MetricsFile::open(path, /*maxVersionPolls*/ 100, file) != metrics::FileStatus::Ok) { ... }
 metrics::MetricsReader reader(file);
 
-reader.forEachLive([](const metrics::Live& l) { /* l.typeId, l.kind, l.regId, l.value, l.key, l.label */ });
-int32_t slot = reader.findFirst(typeId, key);        // -1 if none
+reader.forEachLive([](const metrics::Live& l) { /* l.typeId, l.kind, l.regId, l.ownerTag, l.value, l.key(), l.label() */ });
+metrics::SlotRef ref = reader.findFirst(typeId, key);   // ref.slot == -1 if none
 ```
 
-`read(slot)` returns `SlotView = std::variant<Empty, Live, Reused>`. It reads the state, the regId, the value, then
-the state and the regId again (acquire each). A slot freed while it was being read is `Empty`; one reallocated
-while it was being read is `Reused{slot, oldRegId}`, never `Live` with an old regId and a new owner's value.
-`forEachLive` reads a `Reused` slot once more. The `key` and `label` views point into the mapping and are valid
-until the slot is reused; read the slot again to find out.
+`read(slot)` returns `SlotView = std::variant<Empty, Live, Reused>`. It reads the state and regId (acquire), copies
+the scalars, the key, the label and the value out of the file into the returned `Live` (relaxed word loads), then
+issues an acquire fence and re-reads the state and the regId. A slot freed while it was being read is `Empty`; one
+reallocated while it was being read is `Reused{slot, oldRegId}`, never a `Live` that mixes two owners. **Nothing
+points into the mapping**: `Live::key()` and `Live::label()` view the copy inside the `Live` itself, so they stay
+consistent whatever the writer does next (do not keep them past the `Live`'s lifetime). `forEachLive` reads a
+`Reused` slot once more.
+
+`findFirst(typeId, key)` returns `SlotRef{slot, regId}` (`{-1, -1}` if none).
 
 ## Rates and windows
 
 `RateTracker<Capacity, Window>` and `WindowSampler<Capacity, Window>` keep a fixed array with one entry per slot
-(no allocation). An entry restarts when its regId changes or its slot is freed, so a rate never spans two owners.
+(no allocation). An entry restarts when its regId changes, its slot is freed, or its total goes backwards, so a rate
+never spans two owners. A tracker is bound to a reader's file with `bind(reader)`, which refuses (`CapacityTooSmall`,
+the tracker stays unbound and samples nothing) a `Capacity` below the file's slot count instead of truncating.
 
 ```cpp
 metrics::RateTracker<4096, 60> rates;
+if (rates.bind(reader) != metrics::TrackerStatus::Ok) { /* capacity below the file's slots */ }
 rates.sample(reader, nowNs);                         // call at your own period
 std::optional<double> perSecond = rates.perSecond(slot);   // none until two samples, none for a reused slot
+std::optional<double> forOwner = rates.perSecond(slot, regId);   // only if that regId is the one being tracked
 
 metrics::WindowSampler<4096, 60> window;
+(void)window.bind(reader);                           // same capacity rule as RateTracker
 window.sample(reader, nowNs);
 std::optional<int64_t> peak = window.max(slot);      // max of the last Window sampled levels
 std::optional<double> mean = window.avg(slot);       // mean of the last Window samples
@@ -144,17 +162,29 @@ mark and resets it on its own schedule.
 
 ## Prometheus text
 
-`metrics::PrometheusText::render(reader, rates, nowNs, std::span<char> out)` samples the tracker and writes the text
-into the caller's buffer. It returns the length the text needs; when that is larger than the buffer, nothing is
-written, so retry with a larger buffer. It opens no sockets and allocates nothing.
+The caller samples once per scrape; `render` only reads:
+
+```cpp
+rates.sample(reader, nowNs);
+metrics::RenderResult r = metrics::PrometheusText::render(reader, rates, std::span<char>(buf));
+if (r.overflow) { /* buf was too small: its content is unspecified; retry with a bigger buffer */ }
+else            { /* buf[0 .. r.length) is the exposition text */ }
+```
+
+`render` writes each family once, straight into the buffer (no count pass, so the length cannot disagree with the
+text). `length` is the number of bytes written and never exceeds the buffer. It opens no sockets and allocates
+nothing. A rate is printed only when the tracker's entry has the same regId as the live slot.
 
 ```
+# HELP metrics_counter Monotonic total of a slot, by type id, registration id and label.
 # TYPE metrics_counter counter
-metrics_counter{type="1000201",slot="0",label="node=\"1\""} 3500
+metrics_counter{type="1000201",reg_id="1",label="node=\"1\""} 3500
+# HELP metrics_gauge Level of a slot, by type id, registration id and label.
 # TYPE metrics_gauge gauge
-metrics_gauge{type="5",slot="1",label="..."} -7
+metrics_gauge{type="5",reg_id="2",label="..."} -7
+# HELP metrics_rate_per_second Per-second rate of a counter between the reader's last two samples.
 # TYPE metrics_rate_per_second gauge
-metrics_rate_per_second{type="1000201",slot="0",label="node=\"1\""} 2500
+metrics_rate_per_second{type="1000201",reg_id="1",label="node=\"1\""} 2500
 ```
 
 The label text is emitted as one quoted label value (backslash, quote and newline escaped).
@@ -166,7 +196,10 @@ The label text is emitted as one quoted label value (backslash, quote and newlin
 owner calls `doWork(nowNs)` on its duty cycle, and the call returns 0 at once until `intervalNs` has passed on that
 clock. `statm`, `status` and the `fd` directory are opened once in `init` and re-read with `pread` and `getdents64`
 into fixed buffers. A source that fails to read keeps its last value and counts one read error. `procRoot` is
-injectable (`"/proc/self"`) for tests. Type ids are `1'000'301..1'000'305`.
+injectable (`"/proc/self"`) for tests; a root longer than the path buffer is refused at `init`. The open-fd count
+excludes the directory fd that `SystemMetrics` itself holds. **Type ids `1'000'301..1'000'305` are reserved for
+`SystemMetrics`** (open fds, threads, resident bytes, virtual bytes, read errors); Rune's own block is
+`1'000'201..1'000'241`.
 
 ## Capacity
 
@@ -197,7 +230,7 @@ fallback.
 | --- | --- |
 | `MetricsRegistry::create(path, n)` (`O_TRUNC`, `flock` wait loop, throws) | `MetricsFile::create(params, out)` (tmp + rename, status code) |
 | `MetricsRegistry::open(path)` | `MetricsFile::open(path, polls, out)` + `MetricsReader` |
-| `register_counter(name)` / `register_gauge(name)` | `MetricsWriter::allocate(typeId, kind, regId, key, label)` |
+| `register_counter(name)` / `register_gauge(name)` | `MetricsWriter::allocate(typeId, kind, ownerTag, key, label)` (regId is assigned) |
 | `CounterMetric::increment` (`fetch_add`) | `SlotWriter::add` (load, add, release store) |
 | `GaugeMetric::set` | `SlotWriter::set` |
 | `ThroughputMetric`, `WindowedMaxGauge`, `WindowedAvgGauge` (writer-side, own clock) | `RateTracker`, `WindowSampler` (reader-side, caller's `nowNs`) |
@@ -226,9 +259,9 @@ numbers as upper bounds):
 | --- | --- |
 | `SlotWriter::add` | about 0.45 ns (a single store; the loop is hoisted) |
 | `SlotWriter::set` | about 0.47 ns |
-| `MetricsReader::read` | about 12 ns |
-| `forEachLive` over 4096 slots | about 50 us |
-| `RateTracker::sample` over 4096 slots | about 66 us |
+| `MetricsReader::read` | about 60 to 70 ns (copies a 520-byte `Live`; was about 13 ns when it returned views into the file) |
+| `forEachLive` over 4096 slots | about 130 us |
+| `RateTracker::sample` over 4096 slots | about 200 us |
 
 ## Packaging
 
