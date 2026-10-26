@@ -495,6 +495,50 @@ TEST(MetricsReaderRegression, LabelRacesReallocateRegression) {
     EXPECT_EQ(mismatches, 0) << "label of one owner paired with the value of another, seen " << seen;
 }
 
+// The state re-check runs before the regId re-check. The hook sits between them: the slot is freed, reallocated
+// to B (label "B", value 0) and published there. The regId re-check must see B and report Reused; a read that
+// re-checked the regId first would pass it, then see Allocated, and return Live{old regId} of an owner gone.
+namespace {
+struct RecheckState {
+    MetricsWriter* writer = nullptr;
+    bool fired = false;
+    int64_t newRegId = -1;
+};
+struct RecheckHook {
+    RecheckState* st;
+    void operator()(ReadStep step, int32_t slot) const noexcept {
+        if (st->fired || step != ReadStep::AfterStateRecheck) return;
+        st->fired = true;
+        (void)st->writer->free(slot);
+        st->newRegId = st->writer->allocate(2, MetricKind::Gauge, -1, {}, "B").regId;  // published, value 0
+    }
+};
+}  // namespace
+
+TEST(MetricsReaderRegression, RecheckOrderRegression) {
+    Env env(1);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
+    auto a = w.allocate(1, MetricKind::Counter, -1, {}, "A-label");
+    a.writer.set(55);
+    RecheckState st{&w};
+    BasicMetricsReader<RecheckHook> r(env.file, RecheckHook{&st});
+    const SlotView v = r.read(0);
+    ASSERT_TRUE(st.fired) << "the hook between the state and regId re-checks never ran";
+    ASSERT_GT(st.newRegId, a.regId);
+    if (const Live* l = std::get_if<Live>(&v)) {
+        FAIL() << "Live{regId " << l->regId << ", value " << l->value << ", label " << l->label()
+               << "} returned for a slot reused before the read was validated";
+    }
+    ASSERT_TRUE(std::holds_alternative<Reused>(v)) << "B is Allocated, so the read is Reused, not Empty";
+    EXPECT_EQ(std::get<Reused>(v).oldRegId, a.regId);
+    // The next read sees B.
+    const SlotView again = r.read(0);
+    ASSERT_TRUE(std::holds_alternative<Live>(again));
+    EXPECT_EQ(std::get<Live>(again).regId, st.newRegId);
+    EXPECT_EQ(std::get<Live>(again).label(), "B");
+    EXPECT_EQ(std::get<Live>(again).value, 0);
+}
+
 TEST(MetricsReaderRegression, LabelCopiedBeforeCheckRegression) {
     for (ReadStep when : {ReadStep::AfterFirstRegId, ReadStep::AfterValue}) {
         Env env(2);

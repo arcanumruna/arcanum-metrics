@@ -53,8 +53,9 @@ struct SlotRef {
     int64_t regId;  // -1: none
 };
 
-// Steps of a slot read, for deterministic tests. The default hook is empty.
-enum class ReadStep : int32_t { AfterFirstRegId, AfterValue };
+// Steps of a slot read, for deterministic tests (AfterStateRecheck sits between the state and regId re-checks).
+// The default hook is empty.
+enum class ReadStep : int32_t { AfterFirstRegId, AfterValue, AfterStateRecheck };
 struct NoReadHook {
     void operator()(ReadStep, int32_t) const noexcept {}
 };
@@ -99,6 +100,7 @@ public:
         if (ref32(m, kMetaStateOffset).load(std::memory_order_acquire) != static_cast<int32_t>(SlotState::Allocated)) {
             return Empty{};  // freed while reading
         }
+        hook_(ReadStep::AfterStateRecheck, slot);
         if (ref64(m, kMetaRegIdOffset).load(std::memory_order_acquire) != regId) return Reused{slot, regId};
         return view;
     }
