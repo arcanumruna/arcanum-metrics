@@ -182,3 +182,48 @@ TEST(PrometheusTextRegression, ZeroAllocRenderRegression) {
     }
     EXPECT_EQ(scope.count(), 0);
 }
+
+// putEscaped writes runs of plain characters in one put: escapes at the start, the end, back to back and alone
+// must give the same text as one escape per character, and a cut buffer at every length gives a prefix.
+TEST(PrometheusTextRegression, EscapeRunsTableRegression) {
+    struct Case {
+        const char* label;
+        const char* escaped;
+    };
+    const Case cases[] = {
+        {"", ""},
+        {"plain", "plain"},
+        {"\"lead", "\\\"lead"},
+        {"trail\\", "trail\\\\"},
+        {"\n", "\\n"},
+        {"\\\"\n", "\\\\\\\"\\n"},
+        {"a\"\"b", "a\\\"\\\"b"},
+        {"x\ny\\z\"", "x\\ny\\\\z\\\""},
+    };
+    for (const Case& k : cases) {
+        SCOPED_TRACE(k.escaped);
+        Env env(2);
+        MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
+        auto g = w.allocate(5, MetricKind::Gauge, -1, {}, k.label);
+        ASSERT_EQ(g.status, AllocStatus::Ok);
+        g.writer.set(4);
+        MetricsReader r(env.file);
+        auto rt = metrics::testing::makeRates<2, 4>(r);
+        rt->sample(r, 0);
+        char buf[1024];
+        const RenderResult res = PrometheusText::render(r, *rt, buf);
+        ASSERT_FALSE(res.overflow);
+        const std::string full(buf, res.length);
+        const std::string want = std::string(kCounterHead) + kGaugeHead + "metrics_gauge{type=\"5\",reg_id=\"1\",label=\"" +
+                                 k.escaped + "\"} 4\n" + kRateHead;
+        EXPECT_EQ(full, want);
+        for (size_t n = 0; n < full.size(); ++n) {
+            std::vector<char> cut(n + 1, '#');
+            const RenderResult c = PrometheusText::render(r, *rt, std::span<char>(cut.data(), n));
+            ASSERT_TRUE(c.overflow) << n;
+            ASSERT_LE(c.length, n);
+            ASSERT_EQ(std::string(cut.data(), c.length), full.substr(0, c.length)) << n;
+            ASSERT_EQ(cut[n], '#') << n;  // never writes past the span
+        }
+    }
+}

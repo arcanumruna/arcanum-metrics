@@ -137,7 +137,11 @@ points into the mapping**: `Live::key()` and `Live::label()` view the copy insid
 consistent whatever the writer does next (do not keep them past the `Live`'s lifetime). `forEachLive` reads a
 `Reused` slot once more.
 
-`findFirst(typeId, key)` returns `SlotRef{slot, regId}` (`{-1, -1}` if none).
+`read(slot, Live& out)` does the same read into a caller's `Live` and returns `ReadStatus` (`Empty`, `Live` or
+`Reused`; on `Reused`, `out.regId` is the old owner's regId and the rest of `out` is unspecified). It avoids building
+a `SlotView` per call; `forEachLive`, `findFirst` and the samplers each reuse one stack `Live` through it.
+
+`findFirst(typeId, key)` returns `SlotRef{slot, regId}` (`{-1, -1}` if none), reading a `Reused` slot once more.
 
 ## Rates and windows
 
@@ -262,9 +266,10 @@ numbers as upper bounds):
 | --- | --- |
 | `SlotWriter::add` | about 0.45 ns (a single store; the loop is hoisted) |
 | `SlotWriter::set` | about 0.47 ns |
-| `MetricsReader::read` | about 60 to 70 ns (copies a 520-byte `Live`; was about 13 ns when it returned views into the file) |
-| `forEachLive` over 4096 slots | about 130 us |
-| `RateTracker::sample` over 4096 slots | about 200 us |
+| `MetricsReader::read(slot)` | about 33 ns (builds the 536-byte `SlotView`, holding a 528-byte `Live`, in place) |
+| `MetricsReader::read(slot, Live&)` | about 25 ns (fills a caller's `Live`; `forEachLive` and the samplers use it) |
+| `forEachLive` over 4096 slots | about 100 us |
+| `RateTracker::sample` over 4096 slots | about 115 us |
 
 ## Packaging
 

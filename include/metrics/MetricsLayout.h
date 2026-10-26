@@ -1,6 +1,7 @@
 #pragma once
 // On-disk layout of a metrics file, mirroring Aeron CountersManager.
 // Little-endian. [header 4 KiB][maxSlots x 512 B metadata][maxSlots x 128 B values].
+#include <atomic>
 #include <bit>
 #include <cstdint>
 
@@ -55,6 +56,12 @@ static_assert(kMetaLabelOffset + kMaxLabelLength == kMetadataRecordLength,
               "the last metadata field must end exactly at the record length");
 static_assert(kValueRecordLength == 128 && kValueRecordLength % 64 == 0 && kHeaderLength % 64 == 0);
 static_assert(kMetadataRecordLength % 64 == 0);
+static_assert(kMaxKeyLength % 4 == 0 && kMaxLabelLength % 4 == 0 && kMetaKeyOffset % 4 == 0 &&
+              kMetaLabelOffset % 4 == 0, "key and label are written and read as 32-bit words");
+// Every shared word is read and written through atomic_ref; a lock-based fallback would put a hidden lock on
+// the hot path and would not work across processes on the mmap'ed file.
+static_assert(std::atomic_ref<int32_t>::is_always_lock_free && std::atomic_ref<int64_t>::is_always_lock_free &&
+              std::atomic_ref<uint32_t>::is_always_lock_free, "metrics words must be lock-free atomics");
 
 enum class SlotState : int32_t { Unused = 0, Allocated = 1, Freed = -1 };
 enum class MetricKind : int32_t { Counter = 1, Gauge = 2 };

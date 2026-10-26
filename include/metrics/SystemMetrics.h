@@ -68,10 +68,10 @@ public:
         return Status::Ok;
     }
 
-    // Returns the number of samples taken (0 or 1). Not due until intervalNs has passed on the caller's clock.
     // The fd of the opened fd directory (it is listed in its own directory on a real /proc; see sample()).
     [[nodiscard]] int procDirFd() const noexcept { return fdDirFd_; }
 
+    // Returns the number of samples taken (0 or 1). Not due until intervalNs has passed on the caller's clock.
     int doWork(int64_t nowNs) noexcept {
         if (std::holds_alternative<Uninit>(schedule_)) return 0;
         if (const auto* s = std::get_if<Sampled>(&schedule_)) {

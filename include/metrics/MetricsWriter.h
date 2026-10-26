@@ -15,9 +15,6 @@
 
 namespace metrics {
 
-static_assert(kMaxKeyLength % 4 == 0 && kMaxLabelLength % 4 == 0 && kMetaKeyOffset % 4 == 0 &&
-              kMetaLabelOffset % 4 == 0, "key and label are written and read as 32-bit words");
-
 enum class AllocStatus : int32_t { Ok, Full, KeyTooLong, LabelTooLong, InvalidType, InvalidOwnerTag };
 enum class FreeStatus : int32_t { Ok, NotAllocated, OutOfRange };
 enum class WriterStatus : int32_t { Ok, FreeStackTooSmall, ReadOnlyFile, FileInUse };

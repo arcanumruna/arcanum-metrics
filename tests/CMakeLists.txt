@@ -27,8 +27,12 @@ add_test(NAME MetricsWriterRegression.NoAtomicRmwSourceRegression
          COMMAND ${CMAKE_COMMAND} -DHEADER_DIR=${PROJECT_SOURCE_DIR}/include -P ${_guard})
 add_test(NAME MetricsWriterRegression.NoAtomicRmwAllowsLoadStoreRegression
          COMMAND ${CMAKE_COMMAND} -DHEADER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/rmw_ok -P ${_guard})
+# Brackets, semicolons and a trailing backslash in the source must not merge lines into a false report.
+add_test(NAME MetricsWriterRegression.NoAtomicRmwBracketCommentRegression
+         COMMAND ${CMAKE_COMMAND} -DHEADER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/rmw_bracket_comment -P ${_guard})
 # The guard must fire: each fixture holds one forbidden construct and the script must report it.
-foreach(_case rmw_fetch_add rmw_operator rmw_mutex rmw_cas rmw_thread_local)
+foreach(_case rmw_fetch_add rmw_operator rmw_mutex rmw_cas rmw_thread_local rmw_multiline rmw_inc_ref
+              rmw_semicolon)
     add_test(NAME MetricsWriterRegression.NoAtomicRmwFiresRegression.${_case}
              COMMAND ${CMAKE_COMMAND} -DHEADER_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/${_case} -P ${_guard})
     set_tests_properties(MetricsWriterRegression.NoAtomicRmwFiresRegression.${_case} PROPERTIES

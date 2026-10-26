@@ -80,13 +80,18 @@ private:
             const auto r = std::to_chars(tmp, tmp + sizeof tmp, v);
             put(std::string_view(tmp, static_cast<size_t>(r.ptr - tmp)));
         }
+        // Runs of characters that need no escape are written with one put each, not one per character.
         void putEscaped(std::string_view v) noexcept {
-            for (const char c : v) {
-                if (c == '\\') put("\\\\");
-                else if (c == '"') put("\\\"");
-                else if (c == '\n') put("\\n");
-                else putChar(c);
+            size_t run = 0;
+            for (size_t i = 0; i < v.size(); ++i) {
+                const char c = v[i];
+                const char* esc = c == '\\' ? "\\\\" : c == '"' ? "\\\"" : c == '\n' ? "\\n" : nullptr;
+                if (esc == nullptr) continue;
+                put(v.substr(run, i - run));
+                put(esc);
+                run = i + 1;
             }
+            put(v.substr(run));
         }
     };
 
