@@ -319,3 +319,46 @@ TEST(MetricsWriterRegression, ReadOnlyMappingRefusedRegression) {
     MetricsFile unmapped;
     EXPECT_EQ(MetricsWriter::create(unmapped, std::span<int32_t>(stack), w), WriterStatus::ReadOnlyFile);
 }
+
+// A copy would share the file and the free stack but keep its own counters: two owners of one slot and regId.
+TEST(MetricsWriterRegression, WriterNotCopyableRegression) {
+    static_assert(!std::is_copy_constructible_v<MetricsWriter>, "a writer copy hands out duplicate slots");
+    static_assert(!std::is_copy_assignable_v<MetricsWriter>, "a writer copy hands out duplicate slots");
+    static_assert(std::is_nothrow_move_constructible_v<MetricsWriter>);
+    static_assert(std::is_nothrow_move_assignable_v<MetricsWriter>);
+    SUCCEED();
+}
+
+TEST(MetricsWriterRegression, MovedFromWriterAllocatesNothingRegression) {
+    Env env(4);
+    MetricsWriter a = metrics::testing::makeWriter(env.file, env.stack);
+    const AllocResult first = a.allocate(1, MetricKind::Counter, -1, {}, "first");
+    ASSERT_EQ(first.status, AllocStatus::Ok);
+    ASSERT_EQ(a.free(first.writer.slot()), FreeStatus::Ok);  // a free-stack entry must move too
+    const AllocResult second = a.allocate(1, MetricKind::Counter, -1, {}, "second");
+    ASSERT_EQ(second.status, AllocStatus::Ok);
+
+    MetricsWriter b = std::move(a);  // move construction
+    const AllocResult fromA = a.allocate(1, MetricKind::Counter, -1, {}, "from-moved-from");  // NOLINT(bugprone-use-after-move)
+    EXPECT_EQ(fromA.status, AllocStatus::Full);
+    EXPECT_EQ(fromA.regId, -1);
+    EXPECT_EQ(a.free(second.writer.slot()), FreeStatus::OutOfRange);  // holds no file
+    EXPECT_EQ(a.allocatedCount(), 0);
+    EXPECT_EQ(b.allocatedCount(), 1);
+
+    const AllocResult fromB = b.allocate(1, MetricKind::Counter, -1, {}, "from-moved-to");
+    ASSERT_EQ(fromB.status, AllocStatus::Ok);
+    EXPECT_EQ(fromB.writer.slot(), 1);           // continues the sequence: slot 0 is live, slot 1 is next
+    EXPECT_EQ(fromB.regId, second.regId + 1);    // and the regId counter
+    EXPECT_EQ(env.metaAt<int64_t>(0, kMetaRegIdOffset), second.regId);  // the live slot is untouched
+
+    MetricsWriter c;
+    c = std::move(b);  // move assignment
+    EXPECT_EQ(b.allocate(1, MetricKind::Counter, -1, {}, "x").status, AllocStatus::Full);  // NOLINT(bugprone-use-after-move)
+    ASSERT_EQ(c.free(fromB.writer.slot()), FreeStatus::Ok);
+    const AllocResult fromC = c.allocate(1, MetricKind::Counter, -1, {}, "from-assigned");
+    ASSERT_EQ(fromC.status, AllocStatus::Ok);
+    EXPECT_EQ(fromC.writer.slot(), 1);  // the moved free stack: LIFO reuse of slot 1
+    EXPECT_EQ(fromC.regId, fromB.regId + 1);
+    EXPECT_NE(fromC.writer.slot(), second.writer.slot());
+}

@@ -73,6 +73,16 @@ public:
     // An unbound writer: every allocate returns Full. Use create().
     BasicMetricsWriter() noexcept = default;
 
+    // Move-only. A copy would share the file and the free stack but keep its own counters, so two writers would
+    // hand out the same slot and regId. A moved-from writer holds no file and no stack: allocate returns Full.
+    BasicMetricsWriter(const BasicMetricsWriter&) = delete;
+    BasicMetricsWriter& operator=(const BasicMetricsWriter&) = delete;
+    BasicMetricsWriter(BasicMetricsWriter&& other) noexcept { takeFrom(other); }
+    BasicMetricsWriter& operator=(BasicMetricsWriter&& other) noexcept {
+        if (this != &other) takeFrom(other);
+        return *this;
+    }
+
     // freeStackStorage must hold maxSlots entries (a free slot is pushed at most once); a shorter span is refused
     // rather than silently shrinking the capacity. A read-only mapping (MetricsFile::open) is refused too.
     // On a refusal `out` is left unbound.
@@ -157,6 +167,24 @@ public:
 
 private:
     static AllocResult fail(AllocStatus s) noexcept { return AllocResult{s, SlotWriter(), -1}; }
+    void takeFrom(BasicMetricsWriter& o) noexcept {
+        base_ = o.base_;
+        layout_ = o.layout_;
+        capacity_ = o.capacity_;
+        freeStack_ = o.freeStack_;
+        hook_ = o.hook_;
+        freeCount_ = o.freeCount_;
+        nextUnused_ = o.nextUnused_;
+        allocated_ = o.allocated_;
+        nextRegId_ = o.nextRegId_;
+        o.base_ = nullptr;  // the source is left empty: no file, no stack, nothing to hand out
+        o.layout_ = FileLayout{0};
+        o.capacity_ = 0;
+        o.freeStack_ = nullptr;
+        o.freeCount_ = 0;
+        o.nextUnused_ = 0;
+        o.allocated_ = 0;
+    }
     std::byte* meta(int32_t slot) const noexcept {
         return base_ + layout_.metadataOffset() + int64_t{slot} * kMetadataRecordLength;
     }
