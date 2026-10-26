@@ -362,3 +362,28 @@ TEST(MetricsWriterRegression, MovedFromWriterAllocatesNothingRegression) {
     EXPECT_EQ(fromC.regId, fromB.regId + 1);
     EXPECT_NE(fromC.writer.slot(), second.writer.slot());
 }
+
+// A second create() on a file with live slots would restart at slot 0 and regId 1, clobbering a live owner.
+TEST(MetricsWriterRegression, RecreateOnUsedFileRefusedRegression) {
+    Env env(4);
+    MetricsWriter w = metrics::testing::makeWriter(env.file, env.stack);
+    const AllocResult a = w.allocate(1, MetricKind::Counter, -1, {}, "live");
+    ASSERT_EQ(a.status, AllocStatus::Ok);
+    a.writer.set(4242);
+    std::vector<int32_t> stack2(5);
+    MetricsWriter w2;
+    EXPECT_EQ(MetricsWriter::create(env.file, std::span<int32_t>(stack2), w2), WriterStatus::FileInUse);
+    // Refused: w2 is unbound, and the live slot keeps its owner and value.
+    EXPECT_EQ(w2.allocate(2, MetricKind::Gauge, -1, {}, "intruder").status, AllocStatus::Full);
+    EXPECT_EQ(env.metaAt<int64_t>(0, kMetaRegIdOffset), a.regId);
+    EXPECT_EQ(env.metaAt<int32_t>(0, kMetaStateOffset), static_cast<int32_t>(SlotState::Allocated));
+    EXPECT_EQ(env.value(0), 4242);
+    // A freed slot still marks the file as used (its regId must never be reissued from 1).
+    ASSERT_EQ(w.free(0), FreeStatus::Ok);
+    EXPECT_EQ(MetricsWriter::create(env.file, std::span<int32_t>(stack2), w2), WriterStatus::FileInUse);
+    // A fresh file is accepted, and so is a second create on it while nothing was allocated.
+    Env fresh(4);
+    MetricsWriter f1;
+    EXPECT_EQ(MetricsWriter::create(fresh.file, std::span<int32_t>(fresh.stack), f1), WriterStatus::Ok);
+    EXPECT_EQ(MetricsWriter::create(fresh.file, std::span<int32_t>(fresh.stack), f1), WriterStatus::Ok);
+}

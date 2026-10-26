@@ -98,6 +98,9 @@ slot.set(42);                                        // Gauge
 
 - `MetricsWriter::create` refuses a free-stack span shorter than `maxSlots` (`FreeStackTooSmall`) and a read-only
   mapping from `MetricsFile::open` (`ReadOnlyFile`); it never shrinks the capacity silently.
+  It also refuses a file on which any slot was ever allocated (`FileInUse`): one writer per file, so a second
+  writer never restarts at slot 0 and regId 1 over live owners. `MetricsWriter` is move-only; a moved-from writer
+  holds nothing and every `allocate` on it returns `Full`.
 - **regId and ownerTag.** The `regId` of every allocation is the allocator's own counter: it starts at 1, increases
   by one per successful `allocate`, and is never reused for the writer's life, so two live slots never share one and
   a reused slot always shows a new regId. The third argument of `allocate` is an **owner tag** (`-1` means none, stored

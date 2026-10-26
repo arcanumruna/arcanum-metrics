@@ -20,7 +20,7 @@ static_assert(kMaxKeyLength % 4 == 0 && kMaxLabelLength % 4 == 0 && kMetaKeyOffs
 
 enum class AllocStatus : int32_t { Ok, Full, KeyTooLong, LabelTooLong, InvalidType, InvalidOwnerTag };
 enum class FreeStatus : int32_t { Ok, NotAllocated, OutOfRange };
-enum class WriterStatus : int32_t { Ok, FreeStackTooSmall, ReadOnlyFile };
+enum class WriterStatus : int32_t { Ok, FreeStackTooSmall, ReadOnlyFile, FileInUse };
 
 class SlotWriter {  // trivially copyable value type; exactly one writer thread per slot
 public:
@@ -85,12 +85,23 @@ public:
 
     // freeStackStorage must hold maxSlots entries (a free slot is pushed at most once); a shorter span is refused
     // rather than silently shrinking the capacity. A read-only mapping (MetricsFile::open) is refused too.
+    // A file on which any slot was ever allocated (Allocated or Freed) is refused with FileInUse: a new writer
+    // would restart at slot 0 and regId 1, clobbering a live owner and reissuing its regId.
     // On a refusal `out` is left unbound.
     [[nodiscard]] static WriterStatus create(MetricsFile& file, std::span<int32_t> freeStackStorage,
                                              BasicMetricsWriter& out, Hook hook = Hook{}) noexcept {
         out = BasicMetricsWriter{};
         if (file.base() == nullptr || !file.writable()) return WriterStatus::ReadOnlyFile;
         if (freeStackStorage.size() < static_cast<size_t>(file.layout().maxSlots)) return WriterStatus::FreeStackTooSmall;
+        // Create path only, never the hot path: one acquire load per slot, bounded by the capacity, stopping at
+        // the first slot that is not Unused.
+        const FileLayout layout = file.layout();
+        for (int32_t s = 0; s < layout.maxSlots; ++s) {
+            std::byte* m = file.base() + layout.metadataOffset() + int64_t{s} * kMetadataRecordLength;
+            if (ref32(m, kMetaStateOffset).load(std::memory_order_acquire) != static_cast<int32_t>(SlotState::Unused)) {
+                return WriterStatus::FileInUse;
+            }
+        }
         out.base_ = file.base();
         out.layout_ = file.layout();
         out.capacity_ = file.layout().maxSlots;
