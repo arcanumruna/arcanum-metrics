@@ -227,6 +227,15 @@ public:
         return std::nullopt;
     }
 
+    // The rate of the owner `regId`; none if the slot's tracked owner is another one (reused since the last sample).
+    [[nodiscard]] std::optional<double> perSecond(int32_t slot, int64_t regId) const noexcept {
+        if (slot < 0 || slot >= Capacity) return std::nullopt;
+        if (const auto* r = std::get_if<detail::RateRated>(&entries_[slot]); r != nullptr && r->regId == regId) {
+            return r->perSecond;
+        }
+        return std::nullopt;
+    }
+
 private:
     std::variant<detail::RateAbsent, detail::RateFirst, detail::RateRated> entries_[Capacity]{};
 };

@@ -1,9 +1,12 @@
 #pragma once
 // Prometheus text rendering as a pure function into a caller buffer: it opens no sockets and allocates nothing.
-// Series (the label text is emitted as one quoted, escaped label value):
-//   metrics_counter{type="<typeId>",slot="<slot>",label="<label>"} <total>
+// The caller samples the RateTracker once per scrape (`rates.sample(reader, nowNs)`); render only reads.
+//
+// Series (the label text is emitted as one quoted, escaped label value; reg_id is the slot's unique regId):
+//   metrics_counter{type="<typeId>",reg_id="<regId>",label="<label>"} <total>
 //   metrics_gauge{...} <level>
-//   metrics_rate_per_second{...} <rate>        counters that have a rate only
+//   metrics_rate_per_second{...} <rate>        counters that have a rate for that regId only
+// Each family is preceded by its # HELP and # TYPE lines.
 #include "metrics/MetricsLayout.h"
 #include "metrics/MetricsReader.h"
 
@@ -13,24 +16,49 @@
 #include <cstring>
 #include <span>
 #include <string_view>
-#include <variant>
 
 namespace metrics {
 
+struct RenderResult {
+    size_t length;  // bytes written; never more than the buffer holds
+    bool overflow;  // the text did not fit: the buffer content is unspecified, retry with a bigger buffer
+};
+
 class PrometheusText {
 public:
-    // Samples the tracker at nowNs, then renders. Returns the length the text needs. When that exceeds
-    // out.size() nothing is written (a first pass only counts), so the caller can retry with a larger buffer.
+    // One write pass per family straight into `out` (a family must be one contiguous group, so the reader is
+    // scanned once per family). There is no count pass, so the length can never disagree with what was written.
     template <class Reader, int32_t Capacity, int32_t Window>
-    static size_t render(const Reader& reader, RateTracker<Capacity, Window>& rates, int64_t nowNs,
-                         std::span<char> out) noexcept {
-        rates.sample(reader, nowNs);
-        Sink count{nullptr, 0, 0};
-        emit(reader, rates, count);
-        if (count.len > out.size()) return count.len;
-        Sink write{out.data(), out.size(), 0};
-        emit(reader, rates, write);
-        return write.len;
+    [[nodiscard]] static RenderResult render(const Reader& reader, const RateTracker<Capacity, Window>& rates,
+                                             std::span<char> out) noexcept {
+        Sink s{out.data(), out.size(), 0, false};
+        s.put("# HELP metrics_counter Monotonic total of a slot, by type id, registration id and label.\n"
+              "# TYPE metrics_counter counter\n");
+        reader.forEachLive([&](const Live& l) {
+            if (l.kind != MetricKind::Counter) return;
+            series(s, "metrics_counter", l);
+            s.putNumber(l.value);
+            s.putChar('\n');
+        });
+        s.put("# HELP metrics_gauge Level of a slot, by type id, registration id and label.\n"
+              "# TYPE metrics_gauge gauge\n");
+        reader.forEachLive([&](const Live& l) {
+            if (l.kind != MetricKind::Gauge) return;
+            series(s, "metrics_gauge", l);
+            s.putNumber(l.value);
+            s.putChar('\n');
+        });
+        s.put("# HELP metrics_rate_per_second Per-second rate of a counter between the reader's last two samples.\n"
+              "# TYPE metrics_rate_per_second gauge\n");
+        reader.forEachLive([&](const Live& l) {
+            if (l.kind != MetricKind::Counter) return;
+            const auto rate = rates.perSecond(l.slot, l.regId);  // keyed by regId: never a previous owner's rate
+            if (!rate) return;
+            series(s, "metrics_rate_per_second", l);
+            s.putNumber(*rate);
+            s.putChar('\n');
+        });
+        return RenderResult{s.len, s.overflow};
     }
 
 private:
@@ -38,9 +66,12 @@ private:
         char* dst;
         size_t cap;
         size_t len;
-        void put(std::string_view s) noexcept {
-            if (dst != nullptr && len + s.size() <= cap) std::memcpy(dst + len, s.data(), s.size());
-            len += s.size();
+        bool overflow;
+        void put(std::string_view v) noexcept {
+            if (overflow) return;
+            if (len + v.size() > cap) { overflow = true; return; }  // nothing of v is written
+            if (!v.empty()) std::memcpy(dst + len, v.data(), v.size());
+            len += v.size();
         }
         void putChar(char c) noexcept { put(std::string_view(&c, 1)); }
         template <class T>
@@ -49,8 +80,8 @@ private:
             const auto r = std::to_chars(tmp, tmp + sizeof tmp, v);
             put(std::string_view(tmp, static_cast<size_t>(r.ptr - tmp)));
         }
-        void putEscaped(std::string_view s) noexcept {
-            for (const char c : s) {
+        void putEscaped(std::string_view v) noexcept {
+            for (const char c : v) {
                 if (c == '\\') put("\\\\");
                 else if (c == '"') put("\\\"");
                 else if (c == '\n') put("\\n");
@@ -59,43 +90,15 @@ private:
         }
     };
 
-    template <class Reader>
     static void series(Sink& s, std::string_view family, const Live& l) noexcept {
         s.put(family);
         s.put("{type=\"");
         s.putNumber(l.typeId);
-        s.put("\",slot=\"");
-        s.putNumber(l.slot);
+        s.put("\",reg_id=\"");
+        s.putNumber(l.regId);
         s.put("\",label=\"");
         s.putEscaped(l.label());
         s.put("\"} ");
-    }
-
-    template <class Reader, int32_t Capacity, int32_t Window>
-    static void emit(const Reader& reader, const RateTracker<Capacity, Window>& rates, Sink& s) noexcept {
-        s.put("# TYPE metrics_counter counter\n");
-        reader.forEachLive([&](const Live& l) {
-            if (l.kind != MetricKind::Counter) return;
-            series<Reader>(s, "metrics_counter", l);
-            s.putNumber(l.value);
-            s.putChar('\n');
-        });
-        s.put("# TYPE metrics_gauge gauge\n");
-        reader.forEachLive([&](const Live& l) {
-            if (l.kind != MetricKind::Gauge) return;
-            series<Reader>(s, "metrics_gauge", l);
-            s.putNumber(l.value);
-            s.putChar('\n');
-        });
-        s.put("# TYPE metrics_rate_per_second gauge\n");
-        reader.forEachLive([&](const Live& l) {
-            if (l.kind != MetricKind::Counter) return;
-            const auto rate = rates.perSecond(l.slot);
-            if (!rate) return;
-            series<Reader>(s, "metrics_rate_per_second", l);
-            s.putNumber(*rate);
-            s.putChar('\n');
-        });
     }
 };
 
