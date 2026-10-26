@@ -14,6 +14,7 @@ metrics_add_test(AllocCounterRegressionTest)
 metrics_add_test(MetricsFileRegressionTest)
 metrics_add_test(MetricsWriterRegressionTest)
 metrics_add_test(MetricsReaderRegressionTest)
+metrics_add_test(SystemMetricsRegressionTest)
 
 # Source guard: no read-modify-write atomics or locks in the library headers.
 add_test(NAME MetricsWriterRegression.NoAtomicRmwSourceRegression

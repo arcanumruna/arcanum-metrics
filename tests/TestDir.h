@@ -1,6 +1,7 @@
 #pragma once
 // A per-test temporary directory removed with its contents on destruction.
-#include <dirent.h>
+#include <filesystem>
+#include <system_error>
 #include <string>
 #include <unistd.h>
 #include <cstdlib>
@@ -14,13 +15,8 @@ public:
     }
     ~TestDir() {
         if (dir_.empty()) return;
-        if (DIR* d = ::opendir(dir_.c_str())) {
-            while (const dirent* e = ::readdir(d)) {
-                if (e->d_name[0] != '.') ::unlink((dir_ + "/" + e->d_name).c_str());
-            }
-            ::closedir(d);
-        }
-        ::rmdir(dir_.c_str());
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
     }
     TestDir(const TestDir&) = delete;
     TestDir& operator=(const TestDir&) = delete;
