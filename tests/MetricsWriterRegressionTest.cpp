@@ -108,8 +108,13 @@ TEST_P(MetricsWriterRegressionErrorTable, Row) {
         EXPECT_EQ(env.metaAt<int32_t>(res.writer.slot(), kMetaKindOffset), 2);
         EXPECT_EQ(env.metaAt<int32_t>(res.writer.slot(), kMetaKeyLengthOffset), static_cast<int32_t>(r.keyLen));
         EXPECT_EQ(env.metaAt<int32_t>(res.writer.slot(), kMetaLabelLengthOffset), static_cast<int32_t>(r.labelLen));
-        EXPECT_EQ(std::memcmp(env.meta(res.writer.slot()) + kMetaLabelOffset, label.data(), r.labelLen), 0);
-        EXPECT_EQ(std::memcmp(env.meta(res.writer.slot()) + kMetaKeyOffset, key.data(), r.keyLen), 0);
+        // memcmp with a null pointer is UB even for length 0, and an empty key's data() is null.
+        if (r.labelLen > 0) {
+            EXPECT_EQ(std::memcmp(env.meta(res.writer.slot()) + kMetaLabelOffset, label.data(), r.labelLen), 0);
+        }
+        if (r.keyLen > 0) {
+            EXPECT_EQ(std::memcmp(env.meta(res.writer.slot()) + kMetaKeyOffset, key.data(), r.keyLen), 0);
+        }
         EXPECT_GT(res.regId, 0);
         EXPECT_EQ(env.metaAt<int64_t>(res.writer.slot(), kMetaOwnerTagOffset), r.ownerTag < 0 ? 0 : r.ownerTag);
         EXPECT_EQ(env.metaAt<int64_t>(res.writer.slot(), kMetaRegIdOffset), res.regId);
