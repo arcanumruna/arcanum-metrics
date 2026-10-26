@@ -11,3 +11,4 @@ endfunction()
 
 metrics_add_test(MetricsLayoutRegressionTest)
 metrics_add_test(AllocCounterRegressionTest)
+metrics_add_test(MetricsFileRegressionTest)

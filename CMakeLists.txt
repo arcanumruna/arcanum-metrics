@@ -11,6 +11,7 @@ set(METRICS_SANITIZE "" CACHE STRING "Sanitizers for tests and bench, e.g. addre
 add_library(metrics INTERFACE
         include/metrics/Metrics.h
         include/metrics/MetricsLayout.h
+        include/metrics/MetricsFile.h
         include/metrics/SystemMetrics.h
 )
 
