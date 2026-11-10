@@ -16,6 +16,7 @@ metrics_add_test(MetricsFileRegressionTest)
 metrics_add_test(MetricsWriterRegressionTest)
 metrics_add_test(MetricsReaderRegressionTest)
 metrics_add_test(SystemMetricsRegressionTest)
+metrics_add_test(SystemMetricsPortableRegressionTest)  # rune#908: builds without /proc and getdents64
 metrics_add_test(PrometheusTextRegressionTest)
 metrics_add_test(MetricsConcurrencyRegressionTest)
 target_link_libraries(MetricsConcurrencyRegressionTest PRIVATE Threads::Threads)

@@ -2,6 +2,8 @@
 // Process stats published as gauges from the owner's duty cycle: open fds, threads, resident and virtual bytes,
 // plus a read-error counter. No thread, no clock of its own (the caller passes nowNs), no allocation after init.
 // statm, status and the fd directory are opened once in init and re-read with pread / getdents64 into fixed buffers.
+// Linux only: elsewhere (no /proc, no getdents64) the header still compiles and init() returns Status::Unsupported, so
+// an owner can hold a SystemMetrics unconditionally (rune#908).  METRICS_SYSTEM_METRICS_PROC overrides the detection.
 #include "metrics/MetricsLayout.h"
 #include "metrics/MetricsWriter.h"
 
@@ -12,9 +14,19 @@
 #include <span>
 #include <variant>
 
+#ifndef METRICS_SYSTEM_METRICS_PROC
+#if defined(__linux__)
+#define METRICS_SYSTEM_METRICS_PROC 1
+#else
+#define METRICS_SYSTEM_METRICS_PROC 0
+#endif
+#endif
+
 #include <fcntl.h>
-#include <sys/syscall.h>
 #include <unistd.h>
+#if METRICS_SYSTEM_METRICS_PROC
+#include <sys/syscall.h>
+#endif
 
 namespace metrics {
 
@@ -25,7 +37,9 @@ struct SystemMetricsParams {
 
 class SystemMetrics {
 public:
-    enum class Status : int32_t { Ok, OpenFailed, AllocFailed };
+    enum class Status : int32_t { Ok, OpenFailed, AllocFailed, Unsupported };
+    // False where the process stats are not readable this way (no /proc): init() then returns Unsupported.
+    static constexpr bool kProcSupported = METRICS_SYSTEM_METRICS_PROC != 0;
 
     // Type ids sit beside Rune's own block (1'000'201..1'000'241) and do not overlap it.
     static constexpr int32_t kTypeOpenFds = 1'000'301;
@@ -41,6 +55,12 @@ public:
 
     template <class Writer>
     [[nodiscard]] Status init(Writer& writer, const SystemMetricsParams& params, std::span<const std::byte> key) noexcept {
+        if constexpr (!kProcSupported) {
+            (void)writer;
+            (void)params;
+            (void)key;
+            return Status::Unsupported;
+        }
         if (!std::holds_alternative<Uninit>(schedule_)) return Status::Ok;
         if (!openAll(params.procRoot)) return Status::OpenFailed;
         struct Def { SlotWriter* out; int32_t type; MetricKind kind; const char* label; };
@@ -190,7 +210,11 @@ private:
             int64_t count = 0;
             ok = ::lseek(fdDirFd_, 0, SEEK_SET) == 0;
             while (ok) {
+#if METRICS_SYSTEM_METRICS_PROC
                 const long got = ::syscall(SYS_getdents64, fdDirFd_, dents, sizeof dents);
+#else
+                const long got = -1;  // unreachable: init() never arms the schedule without /proc
+#endif
                 if (got < 0) { ok = false; break; }
                 if (got == 0) break;
                 for (long off = 0; off < got;) {
