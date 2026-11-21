@@ -5,7 +5,8 @@ A header-only C++23 library for process metrics in a memory-mapped file, modelle
 threads, no allocation and no exceptions on any call. Time never comes from the library: every call that needs it
 takes `nowNs` from the caller.
 
-Version 2.0.0 is a clean break from 1.x (see [Migrating from 1.x](#migrating-from-1x)).
+Version 2.0.0 is a clean break from 1.x (see [Migrating from 1.x](#migrating-from-1x)). Version 2.1.0 adds named
+families, histograms and `renderNamed` (additive: the 2.0.0 API and file layout are unchanged).
 
 ## Contents
 
@@ -15,6 +16,9 @@ Version 2.0.0 is a clean break from 1.x (see [Migrating from 1.x](#migrating-fro
 - [Reader](#reader)
 - [Rates and windows](#rates-and-windows)
 - [Prometheus text](#prometheus-text)
+- [Families](#families)
+- [Histogram](#histogram)
+- [Rendering named series](#rendering-named-series)
 - [SystemMetrics](#systemmetrics)
 - [Capacity](#capacity)
 - [Using it from Rune](#using-it-from-rune)
@@ -195,6 +199,68 @@ metrics_rate_per_second{type="1000201",reg_id="1",label="node=\"1\""} 2500
 ```
 
 The label text is emitted as one quoted label value (backslash, quote and newline escaped).
+
+## Families
+
+A family is a named Prometheus metric (`# HELP`, `# TYPE`) that a set of slots belongs to by `typeId`. It is
+published into the metrics file as a **descriptor slot**, so a reader or exporter needs no table of its own.
+`Families.h`:
+
+```cpp
+metrics::Family rows[] = {
+    {7, "rune_events_total", "Events handled.", metrics::FamilyType::Counter},
+    {8, "rune_depth", "Queue depth.", metrics::FamilyType::Gauge, metrics::Merge::Max},
+};
+metrics::FamilyStatus st = metrics::publishFamilies(writer, rows);  // allocator thread
+```
+
+- `FamilyType` is `Counter`, `Gauge` or `Histogram`. `Merge` (`Sum` or `Max`) says how slots of one series combine;
+  `LabelMode::None` prints no label (SystemMetrics labels are names, not label sets).
+- A descriptor is one slot with `typeId = kFamilyDescriptorType` (**`1'000'306`, reserved**; no other metric may
+  use it). Its key is the family typeId and its label is the tab-separated name, type, scale, merge, label mode,
+  sum typeId and help.
+- `publishFamilies` checks every row before allocating (`BadName`, `BadHelp`, `TooLong`, `Duplicate`,
+  `BadHistogram`); if the file fills up midway the descriptors already allocated are freed (`Full`). It runs on the
+  allocator thread and allocates no heap.
+- `kSystemMetricsFamilies` lists the five SystemMetrics families (`1'000'301`..`1'000'305`) for the same call.
+
+## Histogram
+
+`Histogram.h`: a single-writer histogram. One bucket slot per bound plus `+Inf`, plus one sum slot, allocated all or
+none on the allocator thread:
+
+```cpp
+metrics::HistogramWriter h;
+const int64_t bounds[] = {500, 1000, 5000};  // raw units; 1 to 16 bounds, strictly increasing, each > 0
+metrics::HistogramStatus st = metrics::allocateHistogram(writer, 20, 21, "lane=\"0\"", bounds, /*scaleExp*/ 3, h);
+h.observe(750);  // writer thread: bounds+2 release stores, no read-modify-write atomic
+```
+
+- Buckets are cumulative: `observe(v)` adds 1 to every bucket whose bound is >= v and to `+Inf`, and `v` to the sum.
+- Bucket `i` has `typeId`, key `{i}` and label `<base>,le="<bound>"`; the sum has `sumTypeId`, key `{0xFF}` and
+  label `<base>`. The family row must have type `Histogram` and `sumTypeId` set.
+- `scaleExp` (<= 9): bounds and sum are stored as integers scaled by 10^scaleExp and printed as exact decimals (the family row's `scaleExp` must equal the one passed to `allocateHistogram`: `_sum` prints with the family's, `le` with the allocation's)
+  (`formatScaled`: `(500, 6)` prints `0.0005`).
+- Several writer threads of one series each allocate their own histogram with the same base label; the renderer
+  merges them. `freeHistogram` frees every slot. Refusals: `BadBounds`, `BadScale`, `LabelTooLong`, `InvalidType`,
+  `Full`; the writer is left unbound.
+
+## Rendering named series
+
+`PrometheusText::renderNamed(reader, NamedScratch{live, order}, out)` renders by family. The caller supplies two
+scratch spans (live slot copies and an index array) of the same capacity; if the file has more live slots than that,
+the result has `scratchShort` and `overflow` set and nothing is printed. It allocates nothing and never throws.
+
+- Families print in `typeId` order, each with `# HELP` (when not empty) and `# TYPE` once. Descriptor slots are never
+  printed. Slots of no family print afterwards in the generic form of `render()`.
+- Slots of one family with the same label are one series: counters are summed, gauges are summed or maxed per the
+  family.
+- A histogram prints its `_bucket{...,le="..."}` lines in bound order, then `_sum` (scaled) and `_count` (the merged
+  `+Inf` bucket) per base label.
+- `RenderResult::skipped` counts what was left out, never silently: a series whose label holds a newline or brace
+  (or a non-empty label not ending in a quote); series of a family name published under several typeIds (only the
+  lowest typeId prints); a histogram bucket run without an `le=` label; and a histogram sum slot that matches no
+  bucket base. A base whose bucket runs are all skipped prints nothing.
 
 ## SystemMetrics
 
