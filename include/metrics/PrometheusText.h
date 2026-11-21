@@ -320,6 +320,15 @@ private:
         for (sEnd = sBegin; sEnd < order.size() && at(sEnd).typeId == f.sumTypeId; ++sEnd) {
         }
         size_t sPos = sBegin;
+        // Passes over the sum slots while `orphan` holds, counting each merged series (by key) as skipped.
+        const auto skipSums = [&](auto orphan) noexcept {
+            while (sPos < sEnd && orphan(at(sPos))) {
+                size_t e = sPos + 1;
+                while (e < sEnd && at(e).label() == at(sPos).label() && sameKey(at(sPos), at(e))) ++e;
+                ++skipped;
+                sPos = e;
+            }
+        };
 
         for (size_t i = g; i < gEnd;) {
             const std::string_view base = baseOf(at(i));
@@ -327,6 +336,7 @@ private:
             while (j < gEnd && baseOf(at(j)) == base) ++j;
             // `inf` ends as the merged value of the last bucket run of this base: the +Inf bucket, i.e. the count.
             bool wellFormed = labelPrintable(base);
+            bool anyBucket = false;  // some bucket run of this base was printed
             int64_t inf = 0;
             for (size_t a = i; a < j;) {
                 size_t b = a + 1;
@@ -346,19 +356,20 @@ private:
                     s.putNumber(v);
                     s.putChar('\n');
                     inf = v;
+                    anyBucket = true;
                 }
                 a = b;
             }
             int64_t sum = 0;
             bool haveSum = false;
-            while (sPos < sEnd && at(sPos).label().compare(base) < 0) ++sPos;  // orphan sums are ignored
+            skipSums([&](const Live& l) noexcept { return l.label().compare(base) < 0; });  // orphan sums
             while (sPos < sEnd && at(sPos).label() == base) {
                 sum = static_cast<int64_t>(static_cast<uint64_t>(sum) + static_cast<uint64_t>(at(sPos).value));
                 haveSum = true;
                 ++sPos;
             }
-            if (haveSum && (!emit || !wellFormed)) ++skipped;
-            if (emit && wellFormed) {
+            if (haveSum && (!emit || !wellFormed || !anyBucket)) ++skipped;
+            if (emit && wellFormed && anyBucket) {
                 for (const bool isSum : {true, false}) {
                     s.put(f.name);
                     s.put(isSum ? "_sum" : "_count");
@@ -379,6 +390,7 @@ private:
             }
             i = j;
         }
+        skipSums([](const Live&) noexcept { return true; });  // sums sorting after the last base are orphans too
     }
 
     static void series(Sink& s, std::string_view family, const Live& l) noexcept {
