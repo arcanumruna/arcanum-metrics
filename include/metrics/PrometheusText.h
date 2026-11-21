@@ -7,9 +7,11 @@
 //   metrics_gauge{...} <level>
 //   metrics_rate_per_second{...} <rate>        counters that have a rate for that regId only
 // Each family is preceded by its # HELP and # TYPE lines.
+#include "metrics/Families.h"
 #include "metrics/MetricsLayout.h"
 #include "metrics/MetricsReader.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +24,14 @@ namespace metrics {
 struct RenderResult {
     size_t length;  // bytes written; never more than the buffer holds
     bool overflow;  // the text did not fit: the buffer content is unspecified, retry with a bigger buffer
+    uint32_t skipped = 0;       // renderNamed: series left out because their label holds a newline or a brace
+    bool scratchShort = false;  // renderNamed: more live slots than scratch; overflow is set too
+};
+
+// Caller-owned working space of renderNamed (equal sizes): one Live per live slot and the sort order over them.
+struct NamedScratch {
+    std::span<Live> live;
+    std::span<int32_t> order;
 };
 
 class PrometheusText {
@@ -61,6 +71,145 @@ public:
         return RenderResult{s.len, s.overflow};
     }
 
+    // Named rendering (plan 07g). The live slots are copied into scratch.live and sorted by (typeId, label, key).
+    // Slots of one family with the same label are one series: counters are summed, gauges summed or maxed per the
+    // family. Families print in typeId order, each with # HELP (when not empty) and # TYPE once. Descriptor slots
+    // are never printed. Slots of no family print afterwards in the generic form of render(). A series whose
+    // label holds '\n', '{' or '}' is skipped and counted. Histogram families are not printed here yet.
+    // Allocates nothing and never throws; std::sort works in place on the caller's spans.
+    template <class Reader>
+    [[nodiscard]] static RenderResult renderNamed(const Reader& reader, NamedScratch scratch,
+                                                  std::span<char> out) noexcept {
+        Sink s{out.data(), out.size(), 0, false};
+        const size_t cap = std::min(scratch.live.size(), scratch.order.size());
+        size_t n = 0;
+        bool tooMany = false;
+        reader.forEachLive([&](const Live& l) {
+            if (n >= cap) { tooMany = true; return; }
+            scratch.live[n] = l;
+            scratch.order[n] = static_cast<int32_t>(n);
+            ++n;
+        });
+        if (tooMany) return RenderResult{0, true, 0, true};
+
+        const std::span<Live> live = scratch.live;
+        const std::span<int32_t> order = scratch.order.first(n);
+        std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) noexcept {
+            const Live& x = live[static_cast<size_t>(a)];
+            const Live& y = live[static_cast<size_t>(b)];
+            if (x.typeId != y.typeId) return x.typeId < y.typeId;
+            if (const int c = x.label().compare(y.label()); c != 0) return c < 0;
+            const auto kx = x.key();
+            const auto ky = y.key();
+            return std::lexicographical_compare(kx.begin(), kx.end(), ky.begin(), ky.end());
+        });
+        const auto at = [&](size_t i) -> const Live& { return live[static_cast<size_t>(order[i])]; };
+
+        // The descriptors are contiguous after the sort.
+        size_t dBegin = 0;
+        while (dBegin < n && at(dBegin).typeId < kFamilyDescriptorType) ++dBegin;
+        size_t dEnd = dBegin;
+        while (dEnd < n && at(dEnd).typeId == kFamilyDescriptorType) ++dEnd;
+
+        enum class Role { Named, HistogramSum, None };
+        const auto describe = [&](int32_t typeId, FamilyView& f) noexcept {
+            for (size_t i = dBegin; i < dEnd; ++i) {
+                const Live& d = at(i);
+                int32_t id;
+                std::memcpy(&id, d.keyBytes.data(), 4);
+                if (d.keyLength == 4 && id == typeId && decodeFamily(d, f)) return Role::Named;
+            }
+            for (size_t i = dBegin; i < dEnd; ++i) {
+                FamilyView g;
+                if (decodeFamily(at(i), g) && g.type == FamilyType::Histogram && g.sumTypeId == typeId) {
+                    return Role::HistogramSum;
+                }
+            }
+            return Role::None;
+        };
+
+        uint32_t skipped = 0;
+        for (size_t g = 0; g < n;) {
+            const int32_t typeId = at(g).typeId;
+            size_t gEnd = g;
+            while (gEnd < n && at(gEnd).typeId == typeId) ++gEnd;
+            FamilyView f;
+            if (typeId != kFamilyDescriptorType && describe(typeId, f) == Role::Named &&
+                f.type != FamilyType::Histogram) {
+                if (!f.help.empty()) {
+                    s.put("# HELP ");
+                    s.put(f.name);
+                    s.putChar(' ');
+                    s.putHelp(f.help);
+                    s.putChar('\n');
+                }
+                s.put("# TYPE ");
+                s.put(f.name);
+                s.put(f.type == FamilyType::Counter ? " counter\n" : " gauge\n");
+                const bool byLabel = f.labels == LabelMode::Set;
+                for (size_t i = g; i < gEnd;) {
+                    size_t j = i + 1;
+                    while (j < gEnd && (!byLabel || at(j).label() == at(i).label())) ++j;
+                    int64_t v = at(i).value;
+                    for (size_t k = i + 1; k < j; ++k) {
+                        const int64_t x = at(k).value;
+                        if (f.type == FamilyType::Gauge && f.merge == Merge::Max) {
+                            v = std::max(v, x);
+                        } else {
+                            v = static_cast<int64_t>(static_cast<uint64_t>(v) + static_cast<uint64_t>(x));
+                        }
+                    }
+                    const std::string_view label = byLabel ? at(i).label() : std::string_view{};
+                    if (label.find_first_of("\n{}") != std::string_view::npos) {
+                        ++skipped;
+                    } else {
+                        s.put(f.name);
+                        if (!label.empty()) {
+                            s.putChar('{');
+                            s.put(label);
+                            s.putChar('}');
+                        }
+                        s.putChar(' ');
+                        s.putNumber(v);
+                        s.putChar('\n');
+                    }
+                    i = j;
+                }
+            }
+            g = gEnd;
+        }
+
+        // Slots of no family, in the 2.0 generic form: counters, then gauges.
+        for (const MetricKind kind : {MetricKind::Counter, MetricKind::Gauge}) {
+            bool head = false;
+            for (size_t g = 0; g < n;) {
+                const int32_t typeId = at(g).typeId;
+                size_t gEnd = g;
+                while (gEnd < n && at(gEnd).typeId == typeId) ++gEnd;
+                FamilyView f;
+                if (typeId != kFamilyDescriptorType && describe(typeId, f) == Role::None) {
+                    for (size_t i = g; i < gEnd; ++i) {
+                        const Live& l = at(i);
+                        if (l.kind != kind) continue;
+                        const bool counter = kind == MetricKind::Counter;
+                        if (!head) {
+                            head = true;
+                            s.put(counter ? "# HELP metrics_counter Monotonic total of a slot, by type id, registration id and label.\n"
+                                            "# TYPE metrics_counter counter\n"
+                                          : "# HELP metrics_gauge Level of a slot, by type id, registration id and label.\n"
+                                            "# TYPE metrics_gauge gauge\n");
+                        }
+                        series(s, counter ? "metrics_counter" : "metrics_gauge", l);
+                        s.putNumber(l.value);
+                        s.putChar('\n');
+                    }
+                }
+                g = gEnd;
+            }
+        }
+        return RenderResult{s.len, s.overflow, skipped, false};
+    }
+
 private:
     struct Sink {
         char* dst;
@@ -79,6 +228,19 @@ private:
             char tmp[40];
             const auto r = std::to_chars(tmp, tmp + sizeof tmp, v);
             put(std::string_view(tmp, static_cast<size_t>(r.ptr - tmp)));
+        }
+        // # HELP text: backslash and newline are escaped (the newline cannot occur in a published help).
+        void putHelp(std::string_view v) noexcept {
+            size_t run = 0;
+            for (size_t i = 0; i < v.size(); ++i) {
+                const char c = v[i];
+                const char* esc = c == '\\' ? "\\\\" : c == '\n' ? "\\n" : nullptr;
+                if (esc == nullptr) continue;
+                put(v.substr(run, i - run));
+                put(esc);
+                run = i + 1;
+            }
+            put(v.substr(run));
         }
         // Runs of characters that need no escape are written with one put each, not one per character.
         void putEscaped(std::string_view v) noexcept {
