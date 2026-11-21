@@ -225,3 +225,44 @@ TEST(Histogram, SeveralBasesAndDuplicateFamily) {
               "h_bucket{lane=\"0\",le=\"1\"} 0\nh_bucket{lane=\"0\",le=\"+Inf\"} 1\nh_sum{lane=\"0\"} 5\nh_count{lane=\"0\"} 1\n"
               "h_bucket{lane=\"1\",le=\"1\"} 1\nh_bucket{lane=\"1\",le=\"+Inf\"} 1\nh_sum{lane=\"1\"} 1\nh_count{lane=\"1\"} 1\n");
 }
+
+namespace {
+RenderResult renderRaw(Env& env) {
+    MetricsReader r(env.file);
+    return PrometheusText::renderNamed(r, NamedScratch{env.live, env.order}, std::span<char>(env.buf));
+}
+void rawSlot(Env& env, int32_t typeId, std::string_view label, int64_t v) {
+    const std::byte key[1] = {std::byte{0}};
+    const AllocResult r = env.w.allocate(typeId, MetricKind::Counter, -1, key, label);
+    ASSERT_EQ(r.status, AllocStatus::Ok);
+    r.writer.add(v);
+}
+}  // namespace
+
+TEST(Histogram, OrphanSumCountedSkipped) {
+    Env env(32);
+    env.publishH(5, "h", 0);
+    HistogramWriter a;
+    const int64_t bounds[] = {1};
+    ASSERT_EQ(allocateHistogram(env.w, 5, 505, "lane=\"1\"", bounds, 0, a), HistogramStatus::Ok);
+    a.observe(1);
+    rawSlot(env, 505, "lane=\"0\"", 7);  // sorts before the only base
+    rawSlot(env, 505, "lane=\"9\"", 7);  // sorts after the last base
+    const RenderResult rr = renderRaw(env);
+    const std::string t(env.buf.data(), rr.length);
+    EXPECT_EQ(rr.skipped, 2u);
+    EXPECT_EQ(t,
+              "# HELP h H.\n# TYPE h histogram\n"
+              "h_bucket{lane=\"1\",le=\"1\"} 1\nh_bucket{lane=\"1\",le=\"+Inf\"} 1\nh_sum{lane=\"1\"} 1\nh_count{lane=\"1\"} 1\n");
+}
+
+TEST(Histogram, AllBucketsSkippedPrintsNothing) {
+    Env env(32);
+    env.publishH(5, "h", 0);
+    rawSlot(env, 5, "lane=\"1\"", 3);  // a bucket-typed slot without le=
+    rawSlot(env, 505, "lane=\"1\"", 3);
+    const RenderResult rr = renderRaw(env);
+    const std::string t(env.buf.data(), rr.length);
+    EXPECT_EQ(rr.skipped, 2u);  // the bucket run and the sum
+    EXPECT_EQ(t, "# HELP h H.\n# TYPE h histogram\n");
+}
