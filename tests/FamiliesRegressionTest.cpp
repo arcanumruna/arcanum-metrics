@@ -115,6 +115,17 @@ TEST(Families, RefusalsAllocateNothing) {
     EXPECT_EQ(env.w.allocatedCount(), 0);
 }
 
+TEST(Families, ReservedTypeIdsRefused) {
+    Env env(8);
+    for (const int32_t id : {0, -1, kFamilyDescriptorType}) {
+        const Family row{id, "a", "x", FamilyType::Counter};
+        EXPECT_EQ(publishFamilies(env.w, std::span<const Family>(&row, 1)), FamilyStatus::BadName) << id;
+    }
+    const Family h{7, "h", "x", FamilyType::Histogram, Merge::Sum, LabelMode::Set, kFamilyDescriptorType, 0};
+    EXPECT_EQ(publishFamilies(env.w, std::span<const Family>(&h, 1)), FamilyStatus::BadHistogram);
+    EXPECT_EQ(env.w.allocatedCount(), 0);
+}
+
 TEST(Families, FullFreesWhatItAllocated) {
     Env env(2);
     const Family rows[] = {{1, "a", "x", FamilyType::Counter},

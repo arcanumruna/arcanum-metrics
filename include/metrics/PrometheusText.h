@@ -8,6 +8,7 @@
 //   metrics_rate_per_second{...} <rate>        counters that have a rate for that regId only
 // Each family is preceded by its # HELP and # TYPE lines.
 #include "metrics/Families.h"
+#include "metrics/Histogram.h"
 #include "metrics/MetricsLayout.h"
 #include "metrics/MetricsReader.h"
 
@@ -75,7 +76,11 @@ public:
     // Slots of one family with the same label are one series: counters are summed, gauges summed or maxed per the
     // family. Families print in typeId order, each with # HELP (when not empty) and # TYPE once. Descriptor slots
     // are never printed. Slots of no family print afterwards in the generic form of render(). A series whose
-    // label holds '\n', '{' or '}' is skipped and counted. Histogram families are not printed here yet.
+    // label holds '\n', '{' or '}', or a non-empty label that does not end with '"', is skipped and counted. A family
+    // name published under several typeIds prints only the lowest typeId's family; the others' series are counted
+    // as skipped. A histogram family groups its bucket slots and its sum slots by (base label, key), where the base
+    // label is the bucket label without its trailing ,le="...": buckets print in key (bound) order, then _sum
+    // (scaled) and _count (the merged +Inf bucket) per base label.
     // Allocates nothing and never throws; std::sort works in place on the caller's spans.
     template <class Reader>
     [[nodiscard]] static RenderResult renderNamed(const Reader& reader, NamedScratch scratch,
@@ -134,18 +139,33 @@ public:
             size_t gEnd = g;
             while (gEnd < n && at(gEnd).typeId == typeId) ++gEnd;
             FamilyView f;
-            if (typeId != kFamilyDescriptorType && describe(typeId, f) == Role::Named &&
-                f.type != FamilyType::Histogram) {
-                if (!f.help.empty()) {
-                    s.put("# HELP ");
-                    s.put(f.name);
-                    s.putChar(' ');
-                    s.putHelp(f.help);
-                    s.putChar('\n');
+            const Role role = typeId != kFamilyDescriptorType ? describe(typeId, f) : Role::None;
+            if (role == Role::Named) {
+                // Another descriptor with the same name and a lower typeId owns the name.
+                bool emit = true;
+                for (size_t i = dBegin; i < dEnd && emit; ++i) {
+                    FamilyView o;
+                    if (decodeFamily(at(i), o) && o.typeId < f.typeId && o.name == f.name) emit = false;
                 }
-                s.put("# TYPE ");
-                s.put(f.name);
-                s.put(f.type == FamilyType::Counter ? " counter\n" : " gauge\n");
+                if (emit) {
+                    if (!f.help.empty()) {
+                        s.put("# HELP ");
+                        s.put(f.name);
+                        s.putChar(' ');
+                        s.putHelp(f.help);
+                        s.putChar('\n');
+                    }
+                    s.put("# TYPE ");
+                    s.put(f.name);
+                    s.put(f.type == FamilyType::Counter ? " counter\n"
+                          : f.type == FamilyType::Gauge ? " gauge\n"
+                                                        : " histogram\n");
+                }
+                if (f.type == FamilyType::Histogram) {
+                    renderHistogram(s, f, order, live, g, gEnd, emit, skipped);
+                    g = gEnd;
+                    continue;
+                }
                 const bool byLabel = f.labels == LabelMode::Set;
                 for (size_t i = g; i < gEnd;) {
                     size_t j = i + 1;
@@ -160,7 +180,7 @@ public:
                         }
                     }
                     const std::string_view label = byLabel ? at(i).label() : std::string_view{};
-                    if (label.find_first_of("\n{}") != std::string_view::npos) {
+                    if (!emit || !labelPrintable(label)) {
                         ++skipped;
                     } else {
                         s.put(f.name);
@@ -256,6 +276,110 @@ private:
             put(v.substr(run));
         }
     };
+
+    // A label printed verbatim: no newline or braces, and a non-empty label ends with a closing quote.
+    [[nodiscard]] static bool labelPrintable(std::string_view l) noexcept {
+        return l.find_first_of("\n{}") == std::string_view::npos && (l.empty() || l.back() == '"');
+    }
+    // The label of a bucket slot without its trailing ,le="..." (or le="..." alone). False if it has none.
+    [[nodiscard]] static bool bucketBase(std::string_view l, std::string_view& base) noexcept {
+        const size_t p = l.rfind("le=\"");
+        if (p == std::string_view::npos || l.back() != '"') return false;
+        if (p == 0) { base = {}; return true; }
+        if (l[p - 1] != ',') return false;
+        base = l.substr(0, p - 1);
+        return true;
+    }
+    static bool sameKey(const Live& a, const Live& b) noexcept {
+        const auto x = a.key();
+        const auto y = b.key();
+        return std::equal(x.begin(), x.end(), y.begin(), y.end());
+    }
+
+    // Prints the histogram family `f`: its bucket slots are order[g, gEnd), its sum slots those of sumTypeId.
+    // With emit false (a duplicate family name) nothing is printed and each merged series is counted as skipped.
+    static void renderHistogram(Sink& s, const FamilyView& f, std::span<int32_t> order, std::span<const Live> live,
+                                size_t g, size_t gEnd, bool emit, uint32_t& skipped) noexcept {
+        const auto at = [&](size_t i) -> const Live& { return live[static_cast<size_t>(order[i])]; };
+        const auto baseOf = [&](const Live& l) noexcept {
+            std::string_view b;
+            return bucketBase(l.label(), b) ? b : l.label();
+        };
+        std::sort(order.begin() + static_cast<std::ptrdiff_t>(g), order.begin() + static_cast<std::ptrdiff_t>(gEnd),
+                  [&](int32_t a, int32_t b) noexcept {
+                      const Live& x = live[static_cast<size_t>(a)];
+                      const Live& y = live[static_cast<size_t>(b)];
+                      if (const int c = baseOf(x).compare(baseOf(y)); c != 0) return c < 0;
+                      const auto kx = x.key();
+                      const auto ky = y.key();
+                      return std::lexicographical_compare(kx.begin(), kx.end(), ky.begin(), ky.end());
+                  });
+        // The sum slots, sorted by (label, key) like everything else.
+        size_t sBegin = 0, sEnd = 0;
+        while (sBegin < order.size() && at(sBegin).typeId != f.sumTypeId) ++sBegin;
+        for (sEnd = sBegin; sEnd < order.size() && at(sEnd).typeId == f.sumTypeId; ++sEnd) {
+        }
+        size_t sPos = sBegin;
+
+        for (size_t i = g; i < gEnd;) {
+            const std::string_view base = baseOf(at(i));
+            size_t j = i;
+            while (j < gEnd && baseOf(at(j)) == base) ++j;
+            // `inf` ends as the merged value of the last bucket run of this base: the +Inf bucket, i.e. the count.
+            bool wellFormed = labelPrintable(base);
+            int64_t inf = 0;
+            for (size_t a = i; a < j;) {
+                size_t b = a + 1;
+                int64_t v = at(a).value;
+                while (b < j && sameKey(at(a), at(b))) {
+                    v = static_cast<int64_t>(static_cast<uint64_t>(v) + static_cast<uint64_t>(at(b).value));
+                    ++b;
+                }
+                std::string_view tmp;
+                if (!emit || !wellFormed || !bucketBase(at(a).label(), tmp) || !labelPrintable(at(a).label())) {
+                    ++skipped;
+                } else {
+                    s.put(f.name);
+                    s.put("_bucket{");
+                    s.put(at(a).label());
+                    s.put("} ");
+                    s.putNumber(v);
+                    s.putChar('\n');
+                    inf = v;
+                }
+                a = b;
+            }
+            int64_t sum = 0;
+            bool haveSum = false;
+            while (sPos < sEnd && at(sPos).label().compare(base) < 0) ++sPos;  // orphan sums are ignored
+            while (sPos < sEnd && at(sPos).label() == base) {
+                sum = static_cast<int64_t>(static_cast<uint64_t>(sum) + static_cast<uint64_t>(at(sPos).value));
+                haveSum = true;
+                ++sPos;
+            }
+            if (haveSum && (!emit || !wellFormed)) ++skipped;
+            if (emit && wellFormed) {
+                for (const bool isSum : {true, false}) {
+                    s.put(f.name);
+                    s.put(isSum ? "_sum" : "_count");
+                    if (!base.empty()) {
+                        s.putChar('{');
+                        s.put(base);
+                        s.putChar('}');
+                    }
+                    s.putChar(' ');
+                    if (isSum) {
+                        char num[48];
+                        s.put(std::string_view(num, formatScaled(sum, f.scaleExp, std::span<char>(num))));
+                    } else {
+                        s.putNumber(inf);
+                    }
+                    s.putChar('\n');
+                }
+            }
+            i = j;
+        }
+    }
 
     static void series(Sink& s, std::string_view family, const Live& l) noexcept {
         s.put(family);

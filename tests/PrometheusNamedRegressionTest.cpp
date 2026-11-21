@@ -285,3 +285,26 @@ TEST(PrometheusNamed, NoAllocation) {
     EXPECT_FALSE(rr.overflow);
     EXPECT_GT(rr.length, 0u);
 }
+
+TEST(PrometheusNamed, DuplicateNameAcrossPublishesPrintedOnce) {
+    Env env(16);
+    env.publish({7, "dup_total", "First.", FamilyType::Counter});
+    env.publish({9, "dup_total", "Second.", FamilyType::Counter});
+    env.slot(7, MetricKind::Counter, "x=\"1\"").add(2);
+    env.slot(9, MetricKind::Counter, "x=\"2\"").add(5);
+    env.slot(9, MetricKind::Counter, "x=\"3\"").add(6);
+    const RenderResult rr = env.render();
+    EXPECT_FALSE(rr.overflow);
+    EXPECT_EQ(rr.skipped, 2u);
+    EXPECT_EQ(env.text(rr), "# HELP dup_total First.\n# TYPE dup_total counter\ndup_total{x=\"1\"} 2\n");
+}
+
+TEST(PrometheusNamed, UnterminatedLabelSkipped) {
+    Env env(16);
+    env.publish({7, "a_total", "A.", FamilyType::Counter});
+    env.slot(7, MetricKind::Counter, "x=\"a").add(2);
+    env.slot(7, MetricKind::Counter, "x=\"b\"").add(3);
+    const RenderResult rr = env.render();
+    EXPECT_EQ(rr.skipped, 1u);
+    EXPECT_EQ(env.text(rr), "# HELP a_total A.\n# TYPE a_total counter\na_total{x=\"b\"} 3\n");
+}

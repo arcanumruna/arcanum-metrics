@@ -129,8 +129,11 @@ template <class T>
     };
     for (size_t i = 0; i < rows.size(); ++i) {
         const Family& f = rows[i];
-        if (!detail::isValidFamilyName(f.name)) return refuse(i, FamilyStatus::BadName);
+        if (f.typeId <= 0 || f.typeId == kFamilyDescriptorType || !detail::isValidFamilyName(f.name)) {
+            return refuse(i, FamilyStatus::BadName);
+        }
         if (!detail::isValidHelp(f.help)) return refuse(i, FamilyStatus::BadHelp);
+        if (f.sumTypeId == kFamilyDescriptorType) return refuse(i, FamilyStatus::BadHistogram);
         if (f.type == FamilyType::Histogram &&
             (f.sumTypeId == 0 || f.sumTypeId == f.typeId || f.scaleExp > 9)) {
             return refuse(i, FamilyStatus::BadHistogram);
