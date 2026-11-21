@@ -231,7 +231,7 @@ none on the allocator thread:
 
 ```cpp
 metrics::HistogramWriter h;
-const int64_t bounds[] = {500, 1000, 5000};  // raw units, 1..16, strictly increasing, > 0
+const int64_t bounds[] = {500, 1000, 5000};  // raw units; 1 to 16 bounds, strictly increasing, each > 0
 metrics::HistogramStatus st = metrics::allocateHistogram(writer, 20, 21, "lane=\"0\"", bounds, /*scaleExp*/ 3, h);
 h.observe(750);  // writer thread: bounds+2 release stores, no read-modify-write atomic
 ```
@@ -239,7 +239,7 @@ h.observe(750);  // writer thread: bounds+2 release stores, no read-modify-write
 - Buckets are cumulative: `observe(v)` adds 1 to every bucket whose bound is >= v and to `+Inf`, and `v` to the sum.
 - Bucket `i` has `typeId`, key `{i}` and label `<base>,le="<bound>"`; the sum has `sumTypeId`, key `{0xFF}` and
   label `<base>`. The family row must have type `Histogram` and `sumTypeId` set.
-- `scaleExp` (<= 9): bounds and sum are stored as integers scaled by 10^scaleExp and printed as exact decimals
+- `scaleExp` (<= 9): bounds and sum are stored as integers scaled by 10^scaleExp and printed as exact decimals (the family row's `scaleExp` must equal the one passed to `allocateHistogram`: `_sum` prints with the family's, `le` with the allocation's)
   (`formatScaled`: `(500, 6)` prints `0.0005`).
 - Several writer threads of one series each allocate their own histogram with the same base label; the renderer
   merges them. `freeHistogram` frees every slot. Refusals: `BadBounds`, `BadScale`, `LabelTooLong`, `InvalidType`,
